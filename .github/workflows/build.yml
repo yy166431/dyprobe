@@ -37,7 +37,7 @@ jobs:
             -lobjc \
             -O2 \
             -Wno-deprecated-declarations \
-            DYProbe.m \
+            DYProbe.m fishhook.c \
             -o libAweTrace.dylib
 
       - name: Codesign with ldid (fake-sign)
