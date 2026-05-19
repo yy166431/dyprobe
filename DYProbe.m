@@ -128,11 +128,14 @@ int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     // g_orig_connect lazy resolve（防 constructor 还没跑就被调）
     connect_fn fn = g_orig_connect;
     if (!fn) {
-        fn = (connect_fn)dlsym(RTLD_NEXT, "connect");
-        g_orig_connect = fn;
+        void *libsys = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_LAZY);
+        if (libsys) {
+            fn = (connect_fn)dlsym(libsys, "connect");
+            g_orig_connect = fn;
+        }
     }
     if (!fn) {
-        // dlsym 失败兜底，返回错误避免 NULL crash
+        // dlopen 失败兜底，返回错误避免 NULL crash
         errno = EINVAL;
         return -1;
     }
@@ -234,7 +237,14 @@ static void DYPCapturePluginInfo(void) {
 
 __attribute__((constructor(101)))
 static void DYProbeResolveSymbols(void) {
-    g_orig_connect = (connect_fn)dlsym(RTLD_NEXT, "connect");
+    // iOS 16 上 dlsym(RTLD_NEXT, "connect") 会返回 interpose 后的 dyp_connect，
+    // 导致无限递归。改用显式 dlopen libsystem_kernel 绕开 interpose。
+    void *libsys = dlopen("/usr/lib/system/libsystem_kernel.dylib", RTLD_LAZY);
+    if (libsys) {
+        g_orig_connect = (connect_fn)dlsym(libsys, "connect");
+        // 不 dlclose，保持 handle 有效
+    }
+    // 如果 dlopen 失败，g_orig_connect 保持 NULL，hook 内会兜底
 }
 
 __attribute__((constructor))
@@ -243,8 +253,8 @@ static void DYProbeInit(void) {
     gConnects = [[NSMutableArray alloc] init];
     gOutputPath = DYPDocPath();
 
-    // 5 秒后开 ready，给抖音启动充分时间
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+    // 1.5 秒后开 ready，给抖音启动期一点缓冲（实测 5s 太久）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
         gReady = 1;
     });
