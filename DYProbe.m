@@ -1,16 +1,17 @@
 //
-// DYProbe.m
+// DYProbe.m  — 底层 socket 嗅探版（智能过滤）
 //
-// 原生 ObjC 抓包探针，无 frida 依赖，TrollStore 兼容。
+// 设计：
+//   1. 所有 outbound TCP connect 记录到 events（IP + port + 时间），
+//      用来发现作者新 IP（IP 可能换了）
+//   2. 每个 fd 第一次 send/write 时，看首字节判断是不是 HTTP 明文：
+//        - 是 HTTP method (GET/POST/...) → 标记 fd 为"抓"，记录 IO
+//        - 否则（TLS handshake / 抖音 RPC / 二进制） → 标记 fd 为"忽略"
+//   3. 排除 localhost / link-local / 抖音常见域名 IP（ByteDance CDN）
+//   4. 限制：单 fd 最多 16KB，全局最多 32 个 IO 事件，连接事件 256 个
 //
-// 工作原理：
-//   1. +load 时 method swizzle NSURLSession.dataTaskWithRequest:completionHandler:
-//   2. 拦截命中 host = 106.53.173.140 的请求，记录 URL/headers/body
-//   3. 包装 completionHandler，请求结束时把响应 body/statusCode 也存下来
-//   4. dump 一次插件 BSS 64KB（libswiftMetal.dylib + 0x1734000）
-//   5. 输出到 /var/mobile/Documents/dyprobe_dump.json
-//
-// 抓最多 8 个请求 + 8 个响应，每次 hex/ascii dump 前 8KB。
+// 通过 DYLD_INTERPOSE 替换 libsystem socket 调用，所有 HTTP 库（NSURLSession/
+// CFNetwork/curl/直接 socket）都拦截。
 //
 
 #import <Foundation/Foundation.h>
@@ -19,78 +20,102 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <pthread.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
+#import <arpa/inet.h>
+#import <unistd.h>
+#import <sys/uio.h>
+#import <string.h>
 
-#define DYP_TARGET_HOST   @"106.53.173.140"
-#define DYP_MAX_REQ       8
-#define DYP_MAX_CB        8
-
-// BSS section 起始偏移因 dylib 版本而异。我们通过解析 Mach-O 自己定位
-// __DATA segment 的 vmaddr，再加上每版 BSS 在 __DATA 内的相对位置。
-// 实测：
-//   v260512-21: __DATA.vmaddr=0x12f4000  __bss=0x17330e0  rel=0x43F0E0
-//   v260513-22: __DATA.vmaddr=0x1354000  __bss=0x1792368  rel=0x43E368
-// 差距很小 (~3KB)，统一用动态解析。
-#define DYP_BSS_SIZE      0x10000
-#define DYP_BODY_CAP      8192
+#define DYP_MAX_CONNECT_EVENTS  256
+#define DYP_MAX_IO_EVENTS       64
+#define DYP_BSS_SIZE            0x10000
+#define DYP_BUF_CAP             8192
+#define DYP_PER_FD_MAX_BYTES    16384
 #define DYP_PLUGIN_NAME_1 @"libswiftMetal.dylib"
 #define DYP_PLUGIN_NAME_2 @"libswiftMetal_patched.dylib"
 
-static NSMutableArray *gRequests   = nil;
-static NSMutableArray *gCompletions= nil;
+#define DYLD_INTERPOSE(_replacement, _replacee) \
+    __attribute__((used)) static struct { \
+        const void *replacement; \
+        const void *replacee; \
+    } _interpose_##_replacee \
+    __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)(unsigned long)&_replacement, \
+        (const void *)(unsigned long)&_replacee \
+    };
+
+#pragma mark - 全局状态
+
+static NSMutableArray *gConnects   = nil;  // connect 事件（轻量，全记）
+static NSMutableArray *gIoEvents   = nil;  // IO 事件（只记 HTTP fd）
 static NSDictionary  *gMeta        = nil;
 static NSString      *gBssHex      = nil;
 static NSString      *gBssBase     = nil;
-static int            gReqCount    = 0;
-static int            gCbCount     = 0;
+static int            gConnectCount= 0;
+static int            gIoEventCount= 0;
 static pthread_mutex_t gLock;
 static NSString      *gOutputPath  = nil;
 
-// 诊断字段（声明前置，因为 DYPFlushDump 要引用）
-static int  gDiagSubclassCount = 0;
-static int  gDiagDataHookCount = 0;
-static int  gDiagUploadHookCount = 0;
-static int  gDiagResumeHookCount = 0;
-static int  gDiagResumeHitTarget = 0;
+// fd 状态：0=未判定，1=HTTP 抓取中，2=忽略
+#define DYP_FD_UNKNOWN  0
+#define DYP_FD_CAPTURE  1
+#define DYP_FD_IGNORE   2
+#define DYP_MAX_FD 16384
+static uint8_t  gFdState[DYP_MAX_FD];
+static uint32_t gFdBytesSeen[DYP_MAX_FD];  // 已抓字节数（per-fd 限流）
+static uint32_t gFdDstIp[DYP_MAX_FD];      // connect 时记下来的 IP
+static uint16_t gFdDstPort[DYP_MAX_FD];
+
+// 诊断
+static int gDiagConnectCalls    = 0;
+static int gDiagSendCalls       = 0;
+static int gDiagWriteCalls      = 0;
+static int gDiagWritevCalls     = 0;
+static int gDiagRecvCalls       = 0;
+static int gDiagReadCalls       = 0;
+static int gDiagFdHttpMarked    = 0;
+static int gDiagFdIgnoreMarked  = 0;
 
 #pragma mark - Helpers
 
-static NSString *DYPHexAsciiDump(NSData *data, NSUInteger cap) {
-    if (!data || data.length == 0) return nil;
-    NSUInteger n = MIN(data.length, cap);
-    const unsigned char *bytes = data.bytes;
-    NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
-    NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
-    for (NSUInteger i = 0; i < n; i++) {
-        [hex appendFormat:@"%02x", bytes[i]];
-        unsigned char c = bytes[i];
-        [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
-    }
-    return [NSString stringWithFormat:@"hex=%@\nascii=%@", hex, ascii];
-}
-
-static NSDictionary *DYPDataInfo(NSData *data) {
-    if (!data) return nil;
-    NSUInteger n = MIN(data.length, (NSUInteger)DYP_BODY_CAP);
-    const unsigned char *bytes = data.bytes;
-    NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
-    NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
-    for (NSUInteger i = 0; i < n; i++) {
-        [hex appendFormat:@"%02x", bytes[i]];
-        unsigned char c = bytes[i];
-        [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
-    }
-    return @{
-        @"len": @(data.length),
-        @"captured": @(n),
-        @"hex": hex,
-        @"ascii": ascii,
+static BOOL DYPLooksLikeHTTP(const void *buf, size_t len) {
+    if (!buf || len < 4) return NO;
+    const char *p = (const char *)buf;
+    // HTTP method 列表（最常用的）
+    static const char *methods[] = {
+        "GET ", "POST", "PUT ", "HEAD", "DELE", "OPTI", "PATC", "TRAC", "CONN"
     };
+    for (size_t i = 0; i < sizeof(methods)/sizeof(methods[0]); i++) {
+        if (memcmp(p, methods[i], 4) == 0) return YES;
+    }
+    return NO;
 }
 
-static NSDictionary *DYPHeadersDict(NSURLRequest *req) {
-    NSDictionary *h = req.allHTTPHeaderFields;
-    if (!h) return @{};
-    return [h copy];
+static BOOL DYPShouldIgnoreIP(uint32_t ipBE) {
+    // network byte order，转回主机序对比方便
+    uint32_t ip = ntohl(ipBE);
+    // localhost 127.0.0.0/8
+    if ((ip & 0xFF000000) == 0x7F000000) return YES;
+    // link-local 169.254.0.0/16
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return YES;
+    // any 0.0.0.0
+    if (ip == 0) return YES;
+    return NO;
+}
+
+static NSDictionary *DYPDataInfo(const void *buf, size_t len) {
+    if (!buf || len == 0) return @{@"len": @(len)};
+    size_t n = MIN(len, (size_t)DYP_BUF_CAP);
+    const unsigned char *bytes = (const unsigned char *)buf;
+    NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
+    NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
+    for (size_t i = 0; i < n; i++) {
+        [hex appendFormat:@"%02x", bytes[i]];
+        unsigned char c = bytes[i];
+        [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
+    }
+    return @{@"len": @(len), @"captured": @(n), @"hex": hex, @"ascii": ascii};
 }
 
 static NSString *DYPDocPath(void) {
@@ -100,21 +125,83 @@ static NSString *DYPDocPath(void) {
     return [doc stringByAppendingPathComponent:@"dyprobe_dump.json"];
 }
 
+static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE) {
+    pthread_mutex_lock(&gLock);
+    if (gConnectCount >= DYP_MAX_CONNECT_EVENTS) {
+        pthread_mutex_unlock(&gLock);
+        return;
+    }
+    gConnectCount++;
+    pthread_mutex_unlock(&gLock);
+
+    char ipstr[INET_ADDRSTRLEN] = {0};
+    struct in_addr a; a.s_addr = ipBE;
+    inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
+
+    NSDictionary *e = @{
+        @"fd": @(fd),
+        @"ip": [NSString stringWithUTF8String:ipstr],
+        @"port": @(portHE),
+        @"ts": @([[NSDate date] timeIntervalSince1970]),
+    };
+    pthread_mutex_lock(&gLock);
+    [gConnects addObject:e];
+    pthread_mutex_unlock(&gLock);
+}
+
+static void DYPAddIoEvent(int fd, NSString *op, const void *buf, ssize_t len) {
+    if (len <= 0 || fd < 0 || fd >= DYP_MAX_FD) return;
+    if (gFdBytesSeen[fd] >= DYP_PER_FD_MAX_BYTES) return;
+    pthread_mutex_lock(&gLock);
+    if (gIoEventCount >= DYP_MAX_IO_EVENTS) {
+        pthread_mutex_unlock(&gLock);
+        return;
+    }
+    gIoEventCount++;
+    pthread_mutex_unlock(&gLock);
+
+    // 截到 per-fd 上限
+    uint32_t allowed = DYP_PER_FD_MAX_BYTES - gFdBytesSeen[fd];
+    size_t take = MIN((size_t)len, (size_t)allowed);
+    gFdBytesSeen[fd] += take;
+
+    char ipstr[INET_ADDRSTRLEN] = {0};
+    struct in_addr a; a.s_addr = gFdDstIp[fd];
+    inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
+
+    NSDictionary *info = DYPDataInfo(buf, take);
+    NSDictionary *e = @{
+        @"fd": @(fd),
+        @"op": op,
+        @"ip": [NSString stringWithUTF8String:ipstr],
+        @"port": @(gFdDstPort[fd]),
+        @"data": info,
+        @"ts": @([[NSDate date] timeIntervalSince1970]),
+    };
+    pthread_mutex_lock(&gLock);
+    [gIoEvents addObject:e];
+    pthread_mutex_unlock(&gLock);
+}
+
 static void DYPFlushDump(void) {
     pthread_mutex_lock(&gLock);
     NSDictionary *out = @{
         @"meta":         gMeta ?: @{},
         @"diag":         @{
-            @"subclass_count":     @(gDiagSubclassCount),
-            @"data_hook_calls":    @(gDiagDataHookCount),
-            @"upload_hook_calls":  @(gDiagUploadHookCount),
-            @"resume_hook_calls":  @(gDiagResumeHookCount),
-            @"resume_hit_target":  @(gDiagResumeHitTarget),
+            @"connect_calls":     @(gDiagConnectCalls),
+            @"send_calls":        @(gDiagSendCalls),
+            @"write_calls":       @(gDiagWriteCalls),
+            @"writev_calls":      @(gDiagWritevCalls),
+            @"recv_calls":        @(gDiagRecvCalls),
+            @"read_calls":        @(gDiagReadCalls),
+            @"fd_http_marked":    @(gDiagFdHttpMarked),
+            @"fd_ignore_marked":  @(gDiagFdIgnoreMarked),
+            @"connect_events":    @(gConnectCount),
+            @"io_events":         @(gIoEventCount),
         },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
-        @"requests":     [gRequests copy] ?: @[],
-        @"completions":  [gCompletions copy] ?: @[],
-        @"finished":     @(gCbCount >= 1 || gReqCount >= DYP_MAX_REQ),
+        @"connects":     [gConnects copy] ?: @[],
+        @"io":           [gIoEvents copy] ?: @[],
     };
     NSError *err = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:out
@@ -126,11 +213,179 @@ static void DYPFlushDump(void) {
     pthread_mutex_unlock(&gLock);
 }
 
-#pragma mark - Plugin module discovery
+#pragma mark - 原函数指针
 
-// 作者插件叫 libswiftMetal.dylib，但 Apple 系统也有同名的
-// /usr/lib/swift/libswiftMetal.dylib (Metal Swift bindings)，所以必须用
-// 完整路径过滤：只接受 *.app/Frameworks/* 下的命中。
+typedef int      (*connect_fn)(int, const struct sockaddr *, socklen_t);
+typedef ssize_t  (*send_fn)(int, const void *, size_t, int);
+typedef ssize_t  (*sendto_fn)(int, const void *, size_t, int, const struct sockaddr *, socklen_t);
+typedef ssize_t  (*write_fn)(int, const void *, size_t);
+typedef ssize_t  (*writev_fn)(int, const struct iovec *, int);
+typedef ssize_t  (*recv_fn)(int, void *, size_t, int);
+typedef ssize_t  (*recvfrom_fn)(int, void *, size_t, int, struct sockaddr *, socklen_t *);
+typedef ssize_t  (*read_fn)(int, void *, size_t);
+typedef ssize_t  (*readv_fn)(int, const struct iovec *, int);
+typedef int      (*close_fn)(int);
+
+#define DYP_REAL(fn) ((fn##_fn)dlsym(RTLD_NEXT, #fn))
+
+#pragma mark - 决策：是否抓这个 fd 的 IO
+
+// 第一次 send/write 时调用：判断这个 fd 是不是 HTTP 明文，决定后续是否抓
+static void DYPMaybeMarkFdHttp(int fd, const void *buf, size_t len) {
+    if (fd < 0 || fd >= DYP_MAX_FD) return;
+    if (gFdState[fd] != DYP_FD_UNKNOWN) return;
+    // 只对已知是 outbound TCP 连接的 fd 判定
+    if (gFdDstIp[fd] == 0) return;
+    if (DYPLooksLikeHTTP(buf, len)) {
+        gFdState[fd] = DYP_FD_CAPTURE;
+        gDiagFdHttpMarked++;
+    } else {
+        gFdState[fd] = DYP_FD_IGNORE;
+        gDiagFdIgnoreMarked++;
+    }
+}
+
+#pragma mark - INTERPOSE hooks
+
+int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    gDiagConnectCalls++;
+    if (addr && addr->sa_family == AF_INET && len >= sizeof(struct sockaddr_in)) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        if (!DYPShouldIgnoreIP(sin->sin_addr.s_addr)) {
+            if (fd >= 0 && fd < DYP_MAX_FD) {
+                gFdDstIp[fd]   = sin->sin_addr.s_addr;
+                gFdDstPort[fd] = ntohs(sin->sin_port);
+                gFdState[fd]   = DYP_FD_UNKNOWN;
+                gFdBytesSeen[fd] = 0;
+            }
+            DYPAddConnectEvent(fd, sin->sin_addr.s_addr, ntohs(sin->sin_port));
+        }
+    }
+    return DYP_REAL(connect)(fd, addr, len);
+}
+DYLD_INTERPOSE(dyp_connect, connect);
+
+ssize_t dyp_send(int fd, const void *buf, size_t len, int flags) {
+    gDiagSendCalls++;
+    if (fd >= 0 && fd < DYP_MAX_FD && gFdDstIp[fd] != 0) {
+        if (gFdState[fd] == DYP_FD_UNKNOWN) DYPMaybeMarkFdHttp(fd, buf, len);
+        if (gFdState[fd] == DYP_FD_CAPTURE) DYPAddIoEvent(fd, @"send", buf, (ssize_t)len);
+    }
+    return DYP_REAL(send)(fd, buf, len, flags);
+}
+DYLD_INTERPOSE(dyp_send, send);
+
+ssize_t dyp_sendto(int fd, const void *buf, size_t len, int flags,
+                   const struct sockaddr *to, socklen_t tolen) {
+    if (fd >= 0 && fd < DYP_MAX_FD && gFdDstIp[fd] != 0) {
+        if (gFdState[fd] == DYP_FD_UNKNOWN) DYPMaybeMarkFdHttp(fd, buf, len);
+        if (gFdState[fd] == DYP_FD_CAPTURE) DYPAddIoEvent(fd, @"sendto", buf, (ssize_t)len);
+    }
+    return DYP_REAL(sendto)(fd, buf, len, flags, to, tolen);
+}
+DYLD_INTERPOSE(dyp_sendto, sendto);
+
+ssize_t dyp_write(int fd, const void *buf, size_t count) {
+    gDiagWriteCalls++;
+    if (fd >= 0 && fd < DYP_MAX_FD && gFdDstIp[fd] != 0) {
+        if (gFdState[fd] == DYP_FD_UNKNOWN) DYPMaybeMarkFdHttp(fd, buf, count);
+        if (gFdState[fd] == DYP_FD_CAPTURE) DYPAddIoEvent(fd, @"write", buf, (ssize_t)count);
+    }
+    return DYP_REAL(write)(fd, buf, count);
+}
+DYLD_INTERPOSE(dyp_write, write);
+
+ssize_t dyp_writev(int fd, const struct iovec *iov, int iovcnt) {
+    gDiagWritevCalls++;
+    if (fd >= 0 && fd < DYP_MAX_FD && gFdDstIp[fd] != 0 && iov && iovcnt > 0) {
+        // 取前 256 字节判 HTTP（足够看 method）
+        if (gFdState[fd] == DYP_FD_UNKNOWN && iov[0].iov_base) {
+            DYPMaybeMarkFdHttp(fd, iov[0].iov_base, MIN(iov[0].iov_len, (size_t)256));
+        }
+        if (gFdState[fd] == DYP_FD_CAPTURE) {
+            size_t total = 0;
+            for (int i = 0; i < iovcnt; i++) total += iov[i].iov_len;
+            size_t cap = MIN(total, (size_t)DYP_BUF_CAP);
+            void *buf = malloc(cap);
+            if (buf) {
+                size_t off = 0;
+                for (int i = 0; i < iovcnt && off < cap; i++) {
+                    size_t take = MIN(iov[i].iov_len, cap - off);
+                    memcpy((char *)buf + off, iov[i].iov_base, take);
+                    off += take;
+                }
+                DYPAddIoEvent(fd, @"writev", buf, (ssize_t)off);
+                free(buf);
+            }
+        }
+    }
+    return DYP_REAL(writev)(fd, iov, iovcnt);
+}
+DYLD_INTERPOSE(dyp_writev, writev);
+
+ssize_t dyp_recv(int fd, void *buf, size_t len, int flags) {
+    gDiagRecvCalls++;
+    ssize_t r = DYP_REAL(recv)(fd, buf, len, flags);
+    if (r > 0 && fd >= 0 && fd < DYP_MAX_FD && gFdState[fd] == DYP_FD_CAPTURE) {
+        DYPAddIoEvent(fd, @"recv", buf, r);
+    }
+    return r;
+}
+DYLD_INTERPOSE(dyp_recv, recv);
+
+ssize_t dyp_recvfrom(int fd, void *buf, size_t len, int flags,
+                     struct sockaddr *from, socklen_t *fromlen) {
+    ssize_t r = DYP_REAL(recvfrom)(fd, buf, len, flags, from, fromlen);
+    if (r > 0 && fd >= 0 && fd < DYP_MAX_FD && gFdState[fd] == DYP_FD_CAPTURE) {
+        DYPAddIoEvent(fd, @"recvfrom", buf, r);
+    }
+    return r;
+}
+DYLD_INTERPOSE(dyp_recvfrom, recvfrom);
+
+ssize_t dyp_read(int fd, void *buf, size_t count) {
+    gDiagReadCalls++;
+    ssize_t r = DYP_REAL(read)(fd, buf, count);
+    if (r > 0 && fd >= 0 && fd < DYP_MAX_FD && gFdState[fd] == DYP_FD_CAPTURE) {
+        DYPAddIoEvent(fd, @"read", buf, r);
+    }
+    return r;
+}
+DYLD_INTERPOSE(dyp_read, read);
+
+ssize_t dyp_readv(int fd, const struct iovec *iov, int iovcnt) {
+    ssize_t r = DYP_REAL(readv)(fd, iov, iovcnt);
+    if (r > 0 && fd >= 0 && fd < DYP_MAX_FD && gFdState[fd] == DYP_FD_CAPTURE && iov && iovcnt > 0) {
+        size_t cap = MIN((size_t)r, (size_t)DYP_BUF_CAP);
+        void *buf = malloc(cap);
+        if (buf) {
+            size_t off = 0;
+            for (int i = 0; i < iovcnt && off < cap; i++) {
+                size_t take = MIN(iov[i].iov_len, cap - off);
+                memcpy((char *)buf + off, iov[i].iov_base, take);
+                off += take;
+            }
+            DYPAddIoEvent(fd, @"readv", buf, (ssize_t)off);
+            free(buf);
+        }
+    }
+    return r;
+}
+DYLD_INTERPOSE(dyp_readv, readv);
+
+int dyp_close(int fd) {
+    if (fd >= 0 && fd < DYP_MAX_FD) {
+        gFdState[fd] = 0;
+        gFdDstIp[fd] = 0;
+        gFdDstPort[fd] = 0;
+        gFdBytesSeen[fd] = 0;
+    }
+    return DYP_REAL(close)(fd);
+}
+DYLD_INTERPOSE(dyp_close, close);
+
+#pragma mark - Plugin BSS dump
+
 static BOOL DYPIsPluginPath(NSString *full) {
     if (!full) return NO;
     if ([full hasPrefix:@"/usr/lib/"]) return NO;
@@ -146,333 +401,59 @@ static void DYPCapturePluginInfo(void) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         NSString *full = [NSString stringWithUTF8String:name];
-        if (DYPIsPluginPath(full)) {
-            NSString *base = full.lastPathComponent;
-            const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
-            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-            uintptr_t baseAddr = (uintptr_t)mh;
+        if (!DYPIsPluginPath(full)) continue;
 
-            // 解析 LC_SEGMENT_64 找 __DATA.__bss section（带 __common 一起夹）
-            // 找到的 addr 是 vmaddr，加 slide 得到运行时地址
-            uintptr_t bssRuntimeAddr = 0;
-            uint64_t  bssVmAddr = 0;
-            uint64_t  bssVmSize = 0;
-            const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
-            for (uint32_t c = 0; c < mh->ncmds; c++) {
-                const struct load_command *lc = (const struct load_command *)p;
-                if (lc->cmd == LC_SEGMENT_64) {
-                    const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
-                    if (strncmp(seg->segname, "__DATA", 16) == 0) {
-                        const struct section_64 *sect = (const struct section_64 *)(p + sizeof(struct segment_command_64));
-                        for (uint32_t s = 0; s < seg->nsects; s++) {
-                            if (strncmp(sect[s].sectname, "__bss", 16) == 0) {
-                                bssVmAddr = sect[s].addr;
-                                bssVmSize = sect[s].size;
-                                bssRuntimeAddr = (uintptr_t)(sect[s].addr + slide);
-                                break;
-                            }
+        NSString *base = full.lastPathComponent;
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        uintptr_t baseAddr = (uintptr_t)mh;
+
+        uintptr_t bssRuntimeAddr = 0;
+        uint64_t  bssVmAddr = 0;
+        uint64_t  bssVmSize = 0;
+        const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+        for (uint32_t c = 0; c < mh->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)p;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
+                if (strncmp(seg->segname, "__DATA", 16) == 0) {
+                    const struct section_64 *sect = (const struct section_64 *)(p + sizeof(struct segment_command_64));
+                    for (uint32_t s = 0; s < seg->nsects; s++) {
+                        if (strncmp(sect[s].sectname, "__bss", 16) == 0) {
+                            bssVmAddr = sect[s].addr;
+                            bssVmSize = sect[s].size;
+                            bssRuntimeAddr = (uintptr_t)(sect[s].addr + slide);
+                            break;
                         }
                     }
                 }
-                if (bssRuntimeAddr) break;
-                p += lc->cmdsize;
             }
-
-            // BSS section 通常 ~0x1cd8 字节，太小，扩展到 0x10000 把 __common
-            // 和邻接的 __data 尾部一起抓，方便 diff
-            uintptr_t dumpStart = bssRuntimeAddr;
-            size_t dumpSize = DYP_BSS_SIZE;
-            if (!dumpStart) {
-                // fallback: 旧版固定偏移
-                dumpStart = baseAddr + 0x1734000;
-            }
-
-            gMeta = @{
-                @"plugin_name": base,
-                @"plugin_path": full,
-                @"plugin_base": [NSString stringWithFormat:@"0x%lx", baseAddr],
-                @"plugin_slide":[NSString stringWithFormat:@"0x%lx", slide],
-                @"bss_vmaddr":  [NSString stringWithFormat:@"0x%llx", bssVmAddr],
-                @"bss_vmsize":  [NSString stringWithFormat:@"0x%llx", bssVmSize],
-            };
-            gBssBase = [NSString stringWithFormat:@"0x%lx", dumpStart];
-
-            const unsigned char *bp = (const unsigned char *)dumpStart;
-            NSMutableString *hex = [NSMutableString stringWithCapacity:dumpSize*2];
-            for (size_t k = 0; k < dumpSize; k++) {
-                [hex appendFormat:@"%02x", bp[k]];
-            }
-            gBssHex = hex;
-            return;
+            if (bssRuntimeAddr) break;
+            p += lc->cmdsize;
         }
+
+        uintptr_t dumpStart = bssRuntimeAddr ?: (baseAddr + 0x1734000);
+        size_t dumpSize = DYP_BSS_SIZE;
+
+        gMeta = @{
+            @"plugin_name": base,
+            @"plugin_path": full,
+            @"plugin_base": [NSString stringWithFormat:@"0x%lx", baseAddr],
+            @"plugin_slide":[NSString stringWithFormat:@"0x%lx", slide],
+            @"bss_vmaddr":  [NSString stringWithFormat:@"0x%llx", bssVmAddr],
+            @"bss_vmsize":  [NSString stringWithFormat:@"0x%llx", bssVmSize],
+        };
+        gBssBase = [NSString stringWithFormat:@"0x%lx", dumpStart];
+
+        const unsigned char *bp = (const unsigned char *)dumpStart;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:dumpSize*2];
+        for (size_t k = 0; k < dumpSize; k++) {
+            [hex appendFormat:@"%02x", bp[k]];
+        }
+        gBssHex = hex;
+        return;
     }
     gMeta = @{@"plugin_name": @"NOT_LOADED"};
-}
-
-#pragma mark - Hook
-
-typedef void (^DYPCompletionBlock)(NSData *, NSURLResponse *, NSError *);
-
-// Hook 设计说明：
-// NSURLSession 是 class cluster，调用方用 NSURLSession 父类指针拿到的实际是
-// __NSURLSessionLocal / __NSCFURLLocalSession 等私有子类。class_getInstanceMethod
-// 在父类上拿不到子类的 IMP 重写 → swizzle 父类对子类调用无效。
-//
-// 解决方案：
-//   1) 遍历 objc 类列表，把 NSURLSession 所有子类都 swizzle 一遍
-//   2) Hook NSURLSessionTask -resume：所有 task 类型最终都调它，覆盖率 100%
-//   3) 通过 task 的 currentRequest / originalRequest 拿 URL，KVO 监听 state 拿响应
-
-static IMP gOrig_dataTask_completion = NULL;
-static IMP gOrig_uploadTask_completion = NULL;
-static IMP gOrig_taskResume = NULL;
-
-// 已 swizzle 过的 class 集合（避免重复）
-static NSMutableSet *gSwizzledClasses = nil;
-
-static NSMutableDictionary *gTaskMap = nil;  // task pointer -> reqIdx (NSNumber)
-
-// 通用：包装 completionHandler 用，captures reqIdx + url
-static DYPCompletionBlock DYPWrapCompletion(int reqIdx, NSString *url, DYPCompletionBlock orig) {
-    DYPCompletionBlock origCopy = [orig copy];
-    return ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        @try {
-            pthread_mutex_lock(&gLock);
-            BOOL takeCb = (gCbCount < DYP_MAX_CB);
-            int cbIdx = ++gCbCount;
-            pthread_mutex_unlock(&gLock);
-
-            if (takeCb) {
-                NSMutableDictionary *c = [NSMutableDictionary dictionary];
-                c[@"n"] = @(cbIdx);
-                c[@"req_n"] = @(reqIdx);
-                c[@"url"] = url ?: @"";
-                c[@"data"] = data ? DYPDataInfo(data) : [NSNull null];
-                if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-                    NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-                    c[@"statusCode"] = @(http.statusCode);
-                    c[@"resp_headers"] = http.allHeaderFields ?: @{};
-                }
-                if (err) {
-                    c[@"err"] = @{@"code": @(err.code), @"domain": err.domain ?: @"", @"desc": err.localizedDescription ?: @""};
-                }
-                c[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
-                pthread_mutex_lock(&gLock);
-                [gCompletions addObject:c];
-                pthread_mutex_unlock(&gLock);
-                DYPFlushDump();
-            }
-        } @catch (NSException *e) {}
-        if (origCopy) origCopy(data, resp, err);
-    };
-}
-
-// 通用：记录 request
-static int DYPRecordRequest(NSURLRequest *request, NSString *kind, NSData *uploadData) {
-    pthread_mutex_lock(&gLock);
-    BOOL takeReq = (gReqCount < DYP_MAX_REQ);
-    int reqIdx = ++gReqCount;
-    pthread_mutex_unlock(&gLock);
-    if (!takeReq) return reqIdx;
-
-    NSData *body = uploadData ?: request.HTTPBody;
-    NSDictionary *info = @{
-        @"n":       @(reqIdx),
-        @"kind":    kind ?: @"data",
-        @"url":     request.URL.absoluteString ?: @"",
-        @"method":  request.HTTPMethod ?: @"",
-        @"headers": DYPHeadersDict(request) ?: @{},
-        @"body":    body ? DYPDataInfo(body) : [NSNull null],
-        @"timestamp": @([[NSDate date] timeIntervalSince1970]),
-    };
-    pthread_mutex_lock(&gLock);
-    [gRequests addObject:info];
-    pthread_mutex_unlock(&gLock);
-    DYPFlushDump();
-    return reqIdx;
-}
-
-@interface NSURLSession (DYProbe) @end
-@implementation NSURLSession (DYProbe)
-
-- (NSURLSessionDataTask *)dyp_dataTaskWithRequest:(NSURLRequest *)request
-                                completionHandler:(DYPCompletionBlock)completionHandler {
-    gDiagDataHookCount++;
-    @try {
-        NSString *host = request.URL.host;
-        if (host && [host isEqualToString:DYP_TARGET_HOST]) {
-            int reqIdx = DYPRecordRequest(request, @"data", nil);
-            NSString *url = request.URL.absoluteString;
-            DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
-
-            typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
-            Fn fn = (Fn)gOrig_dataTask_completion;
-            return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, wrapped);
-        }
-    } @catch (NSException *e) {}
-
-    typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
-    Fn fn = (Fn)gOrig_dataTask_completion;
-    return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, completionHandler);
-}
-
-- (NSURLSessionUploadTask *)dyp_uploadTaskWithRequest:(NSURLRequest *)request
-                                             fromData:(NSData *)bodyData
-                                    completionHandler:(DYPCompletionBlock)completionHandler {
-    gDiagUploadHookCount++;
-    @try {
-        NSString *host = request.URL.host;
-        if (host && [host isEqualToString:DYP_TARGET_HOST]) {
-            int reqIdx = DYPRecordRequest(request, @"upload", bodyData);
-            NSString *url = request.URL.absoluteString;
-            DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
-
-            typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
-            Fn fn = (Fn)gOrig_uploadTask_completion;
-            return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, wrapped);
-        }
-    } @catch (NSException *e) {}
-
-    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
-    Fn fn = (Fn)gOrig_uploadTask_completion;
-    return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, completionHandler);
-}
-
-@end
-
-#pragma mark - NSURLSessionTask -resume hook
-
-@interface NSURLSessionTask (DYProbe) @end
-@implementation NSURLSessionTask (DYProbe)
-
-- (void)dyp_resume {
-    gDiagResumeHookCount++;
-    @try {
-        // task 自己有 currentRequest / originalRequest
-        NSURLRequest *req = nil;
-        if ([self respondsToSelector:@selector(originalRequest)]) {
-            req = [(id)self performSelector:@selector(originalRequest)];
-        }
-        if (!req && [self respondsToSelector:@selector(currentRequest)]) {
-            req = [(id)self performSelector:@selector(currentRequest)];
-        }
-        if (req) {
-            NSString *host = req.URL.host;
-            if (host && [host isEqualToString:DYP_TARGET_HOST]) {
-                gDiagResumeHitTarget++;
-                // 只记录一次（基于 task 指针 dedup）
-                NSValue *key = [NSValue valueWithPointer:(__bridge void *)self];
-                pthread_mutex_lock(&gLock);
-                BOOL alreadySeen = (gTaskMap[key] != nil);
-                pthread_mutex_unlock(&gLock);
-
-                if (!alreadySeen) {
-                    NSString *kind = NSStringFromClass([self class]);
-                    int reqIdx = DYPRecordRequest(req, kind, nil);
-                    pthread_mutex_lock(&gLock);
-                    gTaskMap[key] = @(reqIdx);
-                    pthread_mutex_unlock(&gLock);
-                }
-            }
-        }
-    } @catch (NSException *e) {}
-
-    typedef void (*Fn)(id, SEL);
-    Fn fn = (Fn)gOrig_taskResume;
-    fn(self, @selector(dyp_resume));
-}
-
-@end
-
-#pragma mark - Install
-
-static void DYPSwizzleOne(Class cls, SEL origSel, SEL newSel, IMP *outOrigIMP) {
-    Method origM = class_getInstanceMethod(cls, origSel);
-    Method newM  = class_getInstanceMethod(cls, newSel);
-    if (!origM || !newM) return;
-    IMP origIMP = method_getImplementation(origM);
-    IMP newIMP  = method_getImplementation(newM);
-    BOOL added = class_addMethod(cls, origSel, newIMP, method_getTypeEncoding(newM));
-    if (added) {
-        *outOrigIMP = origIMP;
-        class_replaceMethod(cls, newSel, origIMP, method_getTypeEncoding(origM));
-    } else {
-        *outOrigIMP = method_getImplementation(origM);
-        method_exchangeImplementations(origM, newM);
-    }
-}
-
-// 遍历所有 NSURLSession 子类，逐个 swizzle
-static void DYPSwizzleSessionSubclass(Class cls) {
-    NSString *name = NSStringFromClass(cls);
-    NSValue *key = [NSValue valueWithPointer:(__bridge void *)cls];
-    if ([gSwizzledClasses containsObject:key]) return;
-    [gSwizzledClasses addObject:key];
-    gDiagSubclassCount++;
-
-    // dataTask
-    Method dataM = class_getInstanceMethod(cls, @selector(dataTaskWithRequest:completionHandler:));
-    if (dataM) {
-        IMP origIMP = NULL;
-        DYPSwizzleOne(cls,
-                      @selector(dataTaskWithRequest:completionHandler:),
-                      @selector(dyp_dataTaskWithRequest:completionHandler:),
-                      &origIMP);
-        if (origIMP && !gOrig_dataTask_completion) {
-            gOrig_dataTask_completion = origIMP;
-        }
-    }
-
-    // uploadTask
-    Method uploadM = class_getInstanceMethod(cls, @selector(uploadTaskWithRequest:fromData:completionHandler:));
-    if (uploadM) {
-        IMP origIMP = NULL;
-        DYPSwizzleOne(cls,
-                      @selector(uploadTaskWithRequest:fromData:completionHandler:),
-                      @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:),
-                      &origIMP);
-        if (origIMP && !gOrig_uploadTask_completion) {
-            gOrig_uploadTask_completion = origIMP;
-        }
-    }
-}
-
-static void DYPInstallSwizzle(void) {
-    gSwizzledClasses = [[NSMutableSet alloc] init];
-    gTaskMap = [[NSMutableDictionary alloc] init];
-
-    // 1) 遍历所有 NSURLSession 子类
-    Class sessionCls = NSClassFromString(@"NSURLSession");
-    if (sessionCls) {
-        unsigned int count = 0;
-        Class *classList = objc_copyClassList(&count);
-        for (unsigned int i = 0; i < count; i++) {
-            Class cls = classList[i];
-            Class superCls = class_getSuperclass(cls);
-            // 找 NSURLSession 的直接子类 + 孙子类（递归判断）
-            Class tmp = cls;
-            while (tmp) {
-                if (tmp == sessionCls) {
-                    DYPSwizzleSessionSubclass(cls);
-                    break;
-                }
-                tmp = class_getSuperclass(tmp);
-            }
-        }
-        free(classList);
-    }
-
-    // 2) Hook NSURLSessionTask -resume（兜底，覆盖所有 task 类型）
-    Class taskCls = NSClassFromString(@"NSURLSessionTask");
-    if (taskCls) {
-        DYPSwizzleOne(taskCls,
-                      @selector(resume),
-                      @selector(dyp_resume),
-                      &gOrig_taskResume);
-    }
-
-    NSLog(@"[DYProbe] swizzle done: %d NSURLSession subclasses, taskResume=%p",
-          gDiagSubclassCount, gOrig_taskResume);
 }
 
 #pragma mark - Entry
@@ -480,14 +461,14 @@ static void DYPInstallSwizzle(void) {
 __attribute__((constructor))
 static void DYProbeInit(void) {
     pthread_mutex_init(&gLock, NULL);
-    gRequests    = [[NSMutableArray alloc] init];
-    gCompletions = [[NSMutableArray alloc] init];
-    gOutputPath  = DYPDocPath();
+    gConnects = [[NSMutableArray alloc] init];
+    gIoEvents = [[NSMutableArray alloc] init];
+    gOutputPath = DYPDocPath();
+    memset(gFdState, 0, sizeof(gFdState));
+    memset(gFdBytesSeen, 0, sizeof(gFdBytesSeen));
+    memset(gFdDstIp, 0, sizeof(gFdDstIp));
+    memset(gFdDstPort, 0, sizeof(gFdDstPort));
 
-    // 立刻装 swizzle，避免错过早期请求
-    DYPInstallSwizzle();
-
-    // 等 1.5 秒确保 libswiftMetal.dylib 加载完后再抓 BSS
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         DYPCapturePluginInfo();
@@ -495,26 +476,12 @@ static void DYProbeInit(void) {
         NSLog(@"[DYProbe] BSS captured, output=%@", gOutputPath);
     });
 
-    // NSURLSession 私有子类可能 lazy 加载，多次重跑 install 抓最新子类
-    for (int sec = 0; sec <= 10; sec++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            DYPInstallSwizzle();
-            DYPFlushDump();
-        });
-    }
-
-    // 周期性 flush + 重 install（防止用户拷文件时还没写盘）
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
         while (1) {
             [NSThread sleepForTimeInterval:5.0];
-            // 每 5 秒重新 install 一次（覆盖晚期 lazy 子类）
-            dispatch_async(dispatch_get_main_queue(), ^{
-                DYPInstallSwizzle();
-            });
             DYPFlushDump();
         }
     });
 
-    NSLog(@"[DYProbe] swizzle installed at constructor, output=%@", gOutputPath);
+    NSLog(@"[DYProbe] socket sniffer installed (all IPs + HTTP auto-detect), output=%@", gOutputPath);
 }
