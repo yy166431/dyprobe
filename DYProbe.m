@@ -45,6 +45,13 @@ static int            gCbCount     = 0;
 static pthread_mutex_t gLock;
 static NSString      *gOutputPath  = nil;
 
+// 诊断字段（声明前置，因为 DYPFlushDump 要引用）
+static int  gDiagSubclassCount = 0;
+static int  gDiagDataHookCount = 0;
+static int  gDiagUploadHookCount = 0;
+static int  gDiagResumeHookCount = 0;
+static int  gDiagResumeHitTarget = 0;
+
 #pragma mark - Helpers
 
 static NSString *DYPHexAsciiDump(NSData *data, NSUInteger cap) {
@@ -222,12 +229,6 @@ static IMP gOrig_taskResume = NULL;
 
 // 已 swizzle 过的 class 集合（避免重复）
 static NSMutableSet *gSwizzledClasses = nil;
-
-static int  gDiagSubclassCount = 0;
-static int  gDiagDataHookCount = 0;
-static int  gDiagUploadHookCount = 0;
-static int  gDiagResumeHookCount = 0;
-static int  gDiagResumeHitTarget = 0;
 
 static NSMutableDictionary *gTaskMap = nil;  // task pointer -> reqIdx (NSNumber)
 
