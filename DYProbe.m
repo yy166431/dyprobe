@@ -56,6 +56,17 @@ static struct {
 static int gDiagConnectCalls = 0;
 static int gDiagSslWriteCalls = 0;
 static int gDiagSslReadCalls  = 0;
+static int gDiagFishhookCalled = 0;
+static int gDiagFishhookRet = -999;
+static uintptr_t gDiagOrigConnect = 0;
+static uintptr_t gDiagOrigSSLWrite = 0;
+static uintptr_t gDiagOrigSSLRead  = 0;
+
+// fishhook.c 内部计数器
+extern int dyp_fh_images_scanned;
+extern int dyp_fh_sections_scanned;
+extern int dyp_fh_symbols_matched;
+extern int dyp_fh_writes_failed;
 
 #pragma mark - 原函数指针
 
@@ -183,6 +194,15 @@ static void DYPFlushDump(void) {
             @"ssl_read_calls":  @(gDiagSslReadCalls),
             @"connect_events":  @(gConnectCount),
             @"ssl_events":      @(gSslEventCount),
+            @"fishhook_called": @(gDiagFishhookCalled),
+            @"fishhook_ret":    @(gDiagFishhookRet),
+            @"orig_connect_ptr":   [NSString stringWithFormat:@"0x%lx", gDiagOrigConnect],
+            @"orig_ssl_write_ptr": [NSString stringWithFormat:@"0x%lx", gDiagOrigSSLWrite],
+            @"orig_ssl_read_ptr":  [NSString stringWithFormat:@"0x%lx", gDiagOrigSSLRead],
+            @"fh_images_scanned":   @(dyp_fh_images_scanned),
+            @"fh_sections_scanned": @(dyp_fh_sections_scanned),
+            @"fh_symbols_matched":  @(dyp_fh_symbols_matched),
+            @"fh_writes_failed":    @(dyp_fh_writes_failed),
         },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
         @"connects":     [gConnects copy] ?: @[],
@@ -333,7 +353,11 @@ static void DYProbeInit(void) {
         {"SSL_write", (void *)dyp_SSL_write, (void **)&g_orig_SSL_write},
         {"SSL_read",  (void *)dyp_SSL_read,  (void **)&g_orig_SSL_read},
     };
-    rebind_symbols(rebs, 3);
+    gDiagFishhookCalled = 1;
+    gDiagFishhookRet = rebind_symbols(rebs, 3);
+    gDiagOrigConnect   = (uintptr_t)g_orig_connect;
+    gDiagOrigSSLWrite  = (uintptr_t)g_orig_SSL_write;
+    gDiagOrigSSLRead   = (uintptr_t)g_orig_SSL_read;
 
     // 1.5 秒后 ready
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
