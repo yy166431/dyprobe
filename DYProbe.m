@@ -17,12 +17,19 @@
 #import <objc/runtime.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
 #import <pthread.h>
 
 #define DYP_TARGET_HOST   @"106.53.173.140"
 #define DYP_MAX_REQ       8
 #define DYP_MAX_CB        8
-#define DYP_BSS_OFFSET    0x1734000
+
+// BSS section 起始偏移因 dylib 版本而异。我们通过解析 Mach-O 自己定位
+// __DATA segment 的 vmaddr，再加上每版 BSS 在 __DATA 内的相对位置。
+// 实测：
+//   v260512-21: __DATA.vmaddr=0x12f4000  __bss=0x17330e0  rel=0x43F0E0
+//   v260513-22: __DATA.vmaddr=0x1354000  __bss=0x1792368  rel=0x43E368
+// 差距很小 (~3KB)，统一用动态解析。
 #define DYP_BSS_SIZE      0x10000
 #define DYP_BODY_CAP      8192
 #define DYP_PLUGIN_NAME_1 @"libswiftMetal.dylib"
@@ -127,23 +134,59 @@ static void DYPCapturePluginInfo(void) {
         NSString *full = [NSString stringWithUTF8String:name];
         if (DYPIsPluginPath(full)) {
             NSString *base = full.lastPathComponent;
-            const struct mach_header *mh = _dyld_get_image_header(i);
+            const struct mach_header_64 *mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
             intptr_t slide = _dyld_get_image_vmaddr_slide(i);
             uintptr_t baseAddr = (uintptr_t)mh;
-            uintptr_t bssAddr  = baseAddr + DYP_BSS_OFFSET;
+
+            // 解析 LC_SEGMENT_64 找 __DATA.__bss section（带 __common 一起夹）
+            // 找到的 addr 是 vmaddr，加 slide 得到运行时地址
+            uintptr_t bssRuntimeAddr = 0;
+            uint64_t  bssVmAddr = 0;
+            uint64_t  bssVmSize = 0;
+            const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+            for (uint32_t c = 0; c < mh->ncmds; c++) {
+                const struct load_command *lc = (const struct load_command *)p;
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *seg = (const struct segment_command_64 *)p;
+                    if (strncmp(seg->segname, "__DATA", 16) == 0) {
+                        const struct section_64 *sect = (const struct section_64 *)(p + sizeof(struct segment_command_64));
+                        for (uint32_t s = 0; s < seg->nsects; s++) {
+                            if (strncmp(sect[s].sectname, "__bss", 16) == 0) {
+                                bssVmAddr = sect[s].addr;
+                                bssVmSize = sect[s].size;
+                                bssRuntimeAddr = (uintptr_t)(sect[s].addr + slide);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (bssRuntimeAddr) break;
+                p += lc->cmdsize;
+            }
+
+            // BSS section 通常 ~0x1cd8 字节，太小，扩展到 0x10000 把 __common
+            // 和邻接的 __data 尾部一起抓，方便 diff
+            uintptr_t dumpStart = bssRuntimeAddr;
+            size_t dumpSize = DYP_BSS_SIZE;
+            if (!dumpStart) {
+                // fallback: 旧版固定偏移
+                dumpStart = baseAddr + 0x1734000;
+            }
 
             gMeta = @{
                 @"plugin_name": base,
                 @"plugin_path": full,
                 @"plugin_base": [NSString stringWithFormat:@"0x%lx", baseAddr],
                 @"plugin_slide":[NSString stringWithFormat:@"0x%lx", slide],
+                @"bss_vmaddr":  [NSString stringWithFormat:@"0x%llx", bssVmAddr],
+                @"bss_vmsize":  [NSString stringWithFormat:@"0x%llx", bssVmSize],
             };
-            gBssBase = [NSString stringWithFormat:@"0x%lx", bssAddr];
+            gBssBase = [NSString stringWithFormat:@"0x%lx", dumpStart];
 
-            const unsigned char *p = (const unsigned char *)bssAddr;
-            NSMutableString *hex = [NSMutableString stringWithCapacity:DYP_BSS_SIZE*2];
-            for (int k = 0; k < DYP_BSS_SIZE; k++) {
-                [hex appendFormat:@"%02x", p[k]];
+            const unsigned char *bp = (const unsigned char *)dumpStart;
+            NSMutableString *hex = [NSMutableString stringWithCapacity:dumpSize*2];
+            for (size_t k = 0; k < dumpSize; k++) {
+                [hex appendFormat:@"%02x", bp[k]];
             }
             gBssHex = hex;
             return;
@@ -157,6 +200,67 @@ static void DYPCapturePluginInfo(void) {
 typedef void (^DYPCompletionBlock)(NSData *, NSURLResponse *, NSError *);
 
 static IMP gOrig_dataTaskWithRequest_completion = NULL;
+static IMP gOrig_uploadTaskWithRequest_fromData_completion = NULL;
+
+// 通用：包装 completionHandler 用，captures reqIdx + url
+static DYPCompletionBlock DYPWrapCompletion(int reqIdx, NSString *url, DYPCompletionBlock orig) {
+    DYPCompletionBlock origCopy = [orig copy];
+    return ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        @try {
+            pthread_mutex_lock(&gLock);
+            BOOL takeCb = (gCbCount < DYP_MAX_CB);
+            int cbIdx = ++gCbCount;
+            pthread_mutex_unlock(&gLock);
+
+            if (takeCb) {
+                NSMutableDictionary *c = [NSMutableDictionary dictionary];
+                c[@"n"] = @(cbIdx);
+                c[@"req_n"] = @(reqIdx);
+                c[@"url"] = url ?: @"";
+                c[@"data"] = data ? DYPDataInfo(data) : [NSNull null];
+                if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+                    NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
+                    c[@"statusCode"] = @(http.statusCode);
+                    c[@"resp_headers"] = http.allHeaderFields ?: @{};
+                }
+                if (err) {
+                    c[@"err"] = @{@"code": @(err.code), @"domain": err.domain ?: @"", @"desc": err.localizedDescription ?: @""};
+                }
+                c[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
+                pthread_mutex_lock(&gLock);
+                [gCompletions addObject:c];
+                pthread_mutex_unlock(&gLock);
+                DYPFlushDump();
+            }
+        } @catch (NSException *e) {}
+        if (origCopy) origCopy(data, resp, err);
+    };
+}
+
+// 通用：记录 request
+static int DYPRecordRequest(NSURLRequest *request, NSString *kind, NSData *uploadData) {
+    pthread_mutex_lock(&gLock);
+    BOOL takeReq = (gReqCount < DYP_MAX_REQ);
+    int reqIdx = ++gReqCount;
+    pthread_mutex_unlock(&gLock);
+    if (!takeReq) return reqIdx;
+
+    NSData *body = uploadData ?: request.HTTPBody;
+    NSDictionary *info = @{
+        @"n":       @(reqIdx),
+        @"kind":    kind ?: @"data",
+        @"url":     request.URL.absoluteString ?: @"",
+        @"method":  request.HTTPMethod ?: @"",
+        @"headers": DYPHeadersDict(request) ?: @{},
+        @"body":    body ? DYPDataInfo(body) : [NSNull null],
+        @"timestamp": @([[NSDate date] timeIntervalSince1970]),
+    };
+    pthread_mutex_lock(&gLock);
+    [gRequests addObject:info];
+    pthread_mutex_unlock(&gLock);
+    DYPFlushDump();
+    return reqIdx;
+}
 
 @interface NSURLSession (DYProbe) @end
 @implementation NSURLSession (DYProbe)
@@ -166,62 +270,13 @@ static IMP gOrig_dataTaskWithRequest_completion = NULL;
     @try {
         NSString *host = request.URL.host;
         if (host && [host isEqualToString:DYP_TARGET_HOST]) {
-            pthread_mutex_lock(&gLock);
-            BOOL takeReq = (gReqCount < DYP_MAX_REQ);
-            int reqIdx = ++gReqCount;
-            pthread_mutex_unlock(&gLock);
+            int reqIdx = DYPRecordRequest(request, @"data", nil);
+            NSString *url = request.URL.absoluteString;
+            DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
 
-            if (takeReq) {
-                NSDictionary *info = @{
-                    @"n":       @(reqIdx),
-                    @"url":     request.URL.absoluteString ?: @"",
-                    @"method":  request.HTTPMethod ?: @"",
-                    @"headers": DYPHeadersDict(request) ?: @{},
-                    @"body":    request.HTTPBody ? DYPDataInfo(request.HTTPBody) : [NSNull null],
-                    @"timestamp": @([[NSDate date] timeIntervalSince1970]),
-                };
-                pthread_mutex_lock(&gLock);
-                [gRequests addObject:info];
-                pthread_mutex_unlock(&gLock);
-
-                DYPCompletionBlock orig = [completionHandler copy];
-                DYPCompletionBlock wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-                    @try {
-                        pthread_mutex_lock(&gLock);
-                        BOOL takeCb = (gCbCount < DYP_MAX_CB);
-                        int cbIdx = ++gCbCount;
-                        pthread_mutex_unlock(&gLock);
-
-                        if (takeCb) {
-                            NSMutableDictionary *c = [NSMutableDictionary dictionary];
-                            c[@"n"] = @(cbIdx);
-                            c[@"req_n"] = @(reqIdx);
-                            c[@"url"] = request.URL.absoluteString ?: @"";
-                            c[@"data"] = data ? DYPDataInfo(data) : [NSNull null];
-                            if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
-                                NSHTTPURLResponse *http = (NSHTTPURLResponse *)resp;
-                                c[@"statusCode"] = @(http.statusCode);
-                                c[@"resp_headers"] = http.allHeaderFields ?: @{};
-                            }
-                            if (err) {
-                                c[@"err"] = @{@"code": @(err.code), @"domain": err.domain ?: @"", @"desc": err.localizedDescription ?: @""};
-                            }
-                            c[@"timestamp"] = @([[NSDate date] timeIntervalSince1970]);
-                            pthread_mutex_lock(&gLock);
-                            [gCompletions addObject:c];
-                            pthread_mutex_unlock(&gLock);
-                            DYPFlushDump();
-                        }
-                    } @catch (NSException *e) {}
-                    if (orig) orig(data, resp, err);
-                };
-
-                typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
-                Fn fn = (Fn)gOrig_dataTaskWithRequest_completion;
-                NSURLSessionDataTask *task = fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, wrapped);
-                DYPFlushDump();
-                return task;
-            }
+            typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
+            Fn fn = (Fn)gOrig_dataTaskWithRequest_completion;
+            return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, wrapped);
         }
     } @catch (NSException *e) {}
 
@@ -230,32 +285,58 @@ static IMP gOrig_dataTaskWithRequest_completion = NULL;
     return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, completionHandler);
 }
 
+- (NSURLSessionUploadTask *)dyp_uploadTaskWithRequest:(NSURLRequest *)request
+                                             fromData:(NSData *)bodyData
+                                    completionHandler:(DYPCompletionBlock)completionHandler {
+    @try {
+        NSString *host = request.URL.host;
+        if (host && [host isEqualToString:DYP_TARGET_HOST]) {
+            int reqIdx = DYPRecordRequest(request, @"upload", bodyData);
+            NSString *url = request.URL.absoluteString;
+            DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
+
+            typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
+            Fn fn = (Fn)gOrig_uploadTaskWithRequest_fromData_completion;
+            return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, wrapped);
+        }
+    } @catch (NSException *e) {}
+
+    typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
+    Fn fn = (Fn)gOrig_uploadTaskWithRequest_fromData_completion;
+    return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, completionHandler);
+}
+
 @end
 
 #pragma mark - Install
 
-static void DYPInstallSwizzle(void) {
-    Class cls = NSClassFromString(@"NSURLSession");
-    if (!cls) return;
-
-    SEL origSel = @selector(dataTaskWithRequest:completionHandler:);
-    SEL newSel  = @selector(dyp_dataTaskWithRequest:completionHandler:);
-
+static void DYPSwizzleOne(Class cls, SEL origSel, SEL newSel, IMP *outOrigIMP) {
     Method origM = class_getInstanceMethod(cls, origSel);
     Method newM  = class_getInstanceMethod(cls, newSel);
     if (!origM || !newM) return;
-
     IMP origIMP = method_getImplementation(origM);
     IMP newIMP  = method_getImplementation(newM);
-
     BOOL added = class_addMethod(cls, origSel, newIMP, method_getTypeEncoding(newM));
     if (added) {
-        gOrig_dataTaskWithRequest_completion = origIMP;
+        *outOrigIMP = origIMP;
         class_replaceMethod(cls, newSel, origIMP, method_getTypeEncoding(origM));
     } else {
-        gOrig_dataTaskWithRequest_completion = method_getImplementation(origM);
+        *outOrigIMP = method_getImplementation(origM);
         method_exchangeImplementations(origM, newM);
     }
+}
+
+static void DYPInstallSwizzle(void) {
+    Class cls = NSClassFromString(@"NSURLSession");
+    if (!cls) return;
+    DYPSwizzleOne(cls,
+                  @selector(dataTaskWithRequest:completionHandler:),
+                  @selector(dyp_dataTaskWithRequest:completionHandler:),
+                  &gOrig_dataTaskWithRequest_completion);
+    DYPSwizzleOne(cls,
+                  @selector(uploadTaskWithRequest:fromData:completionHandler:),
+                  @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:),
+                  &gOrig_uploadTaskWithRequest_fromData_completion);
 }
 
 #pragma mark - Entry
@@ -267,10 +348,24 @@ static void DYProbeInit(void) {
     gCompletions = [[NSMutableArray alloc] init];
     gOutputPath  = DYPDocPath();
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // 立刻装 swizzle，避免错过早期请求
+    DYPInstallSwizzle();
+
+    // 等 1.5 秒确保 libswiftMetal.dylib 加载完后再抓 BSS
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
         DYPCapturePluginInfo();
-        DYPInstallSwizzle();
         DYPFlushDump();
-        NSLog(@"[DYProbe] installed, output=%@", gOutputPath);
+        NSLog(@"[DYProbe] BSS captured, output=%@", gOutputPath);
     });
+
+    // 周期性 flush（防止用户拷文件时还没写盘）
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+        while (1) {
+            [NSThread sleepForTimeInterval:5.0];
+            DYPFlushDump();
+        }
+    });
+
+    NSLog(@"[DYProbe] swizzle installed at constructor, output=%@", gOutputPath);
 }
