@@ -1,0 +1,60 @@
+name: build-dyprobe
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install ldid
+        run: |
+          brew install ldid
+
+      - name: Build arm64 dylib
+        run: |
+          set -ex
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos clang \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -mios-version-min=14.0 \
+            -fobjc-arc \
+            -dynamiclib \
+            -install_name "@rpath/libNetSnoop.dylib" \
+            -framework Foundation \
+            -framework CoreFoundation \
+            -lobjc \
+            -O2 \
+            -Wno-deprecated-declarations \
+            DYProbe.m \
+            -o libNetSnoop.dylib
+
+      - name: Codesign with ldid (fake-sign)
+        run: |
+          ldid -S libNetSnoop.dylib
+          file libNetSnoop.dylib
+          ls -la libNetSnoop.dylib
+
+      - name: Verify Mach-O
+        run: |
+          otool -hv libNetSnoop.dylib
+          otool -L libNetSnoop.dylib
+          dwarfdump --uuid libNetSnoop.dylib
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libNetSnoop
+          path: libNetSnoop.dylib
+          if-no-files-found: error
