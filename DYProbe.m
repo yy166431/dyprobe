@@ -132,7 +132,7 @@ static void DYPSslAddBytes(void *ssl, uint32_t add) {
     }
 }
 
-static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE, int family) {
+static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE, int family, const struct sockaddr *addr, socklen_t addrLen) {
     pthread_mutex_lock(&gLock);
     if (gConnectCount >= DYP_MAX_CONNECT_EVENTS) {
         pthread_mutex_unlock(&gLock);
@@ -141,10 +141,13 @@ static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE, int famil
     gConnectCount++;
     pthread_mutex_unlock(&gLock);
 
-    char ipstr[INET_ADDRSTRLEN] = {0};
+    char ipstr[INET6_ADDRSTRLEN] = {0};
     if (family == AF_INET) {
         struct in_addr a; a.s_addr = ipBE;
         inet_ntop(AF_INET, &a, ipstr, sizeof(ipstr));
+    } else if (family == AF_INET6 && addr && addrLen >= sizeof(struct sockaddr_in6)) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
     }
 
     NSDictionary *e = @{
@@ -232,11 +235,11 @@ static int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
         if (addr->sa_family == AF_INET) {
             const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
             if (!DYPShouldIgnoreIP(sin->sin_addr.s_addr)) {
-                DYPAddConnectEvent(fd, sin->sin_addr.s_addr, ntohs(sin->sin_port), AF_INET);
+                DYPAddConnectEvent(fd, sin->sin_addr.s_addr, ntohs(sin->sin_port), AF_INET, addr, len);
             }
         } else if (addr->sa_family == AF_INET6 && len >= sizeof(struct sockaddr_in6)) {
             const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
-            DYPAddConnectEvent(fd, 0, ntohs(sin6->sin6_port), AF_INET6);
+            DYPAddConnectEvent(fd, 0, ntohs(sin6->sin6_port), AF_INET6, addr, len);
         }
     }
     return rv;
