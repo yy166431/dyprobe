@@ -40,6 +40,7 @@ static NSMutableArray *gSslEvents  = nil;
 static NSDictionary  *gMeta        = nil;
 static NSString      *gBssHex      = nil;
 static NSString      *gBssBase     = nil;
+static NSDictionary  *gPrefs       = nil;  // NSUserDefaults dump
 static int            gConnectCount= 0;
 static int            gSslEventCount= 0;
 static pthread_mutex_t gLock;
@@ -107,6 +108,82 @@ static NSString *DYPDocPath(void) {
     NSString *doc = paths.firstObject;
     if (!doc) doc = @"/var/mobile/Documents";
     return [doc stringByAppendingPathComponent:@"dyprobe_dump.json"];
+}
+
+#pragma mark - NSUserDefaults / 沙盒 plist dump
+
+// 把任意 plist 值 (NSData/NSDate/NSNumber/NSString/Array/Dict) 递归转成 JSON 友好
+static id DYPMakeJSONSafe(id obj, int depth) {
+    if (depth > 8) return @"...max_depth...";
+    if (!obj || obj == [NSNull null]) return [NSNull null];
+    if ([obj isKindOfClass:[NSString class]]) return obj;
+    if ([obj isKindOfClass:[NSNumber class]]) return obj;
+    if ([obj isKindOfClass:[NSDate class]]) {
+        return [NSString stringWithFormat:@"<date>%f", [(NSDate *)obj timeIntervalSince1970]];
+    }
+    if ([obj isKindOfClass:[NSData class]]) {
+        NSData *data = (NSData *)obj;
+        // hex + ascii dump（截 1KB）
+        NSUInteger n = MIN(data.length, (NSUInteger)1024);
+        const unsigned char *bytes = data.bytes;
+        NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
+        NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
+        for (NSUInteger i = 0; i < n; i++) {
+            [hex appendFormat:@"%02x", bytes[i]];
+            unsigned char c = bytes[i];
+            [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
+        }
+        return @{@"<data_len>": @(data.length), @"<hex>": hex, @"<ascii>": ascii};
+    }
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSMutableArray *out = [NSMutableArray array];
+        for (id v in (NSArray *)obj) {
+            id safe = DYPMakeJSONSafe(v, depth + 1);
+            [out addObject:safe ?: [NSNull null]];
+        }
+        return out;
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *out = [NSMutableDictionary dictionary];
+        for (id k in (NSDictionary *)obj) {
+            NSString *ks = [k isKindOfClass:[NSString class]] ? k : [k description];
+            id v = ((NSDictionary *)obj)[k];
+            out[ks] = DYPMakeJSONSafe(v, depth + 1) ?: [NSNull null];
+        }
+        return out;
+    }
+    return [obj description];
+}
+
+static void DYPCapturePrefs(void) {
+    NSMutableDictionary *all = [NSMutableDictionary dictionary];
+    @try {
+        NSDictionary *std = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+        all[@"<standardUserDefaults>"] = DYPMakeJSONSafe(std, 0);
+    } @catch (NSException *e) {
+        all[@"<standardUserDefaults>"] = [NSString stringWithFormat:@"err: %@", e];
+    }
+
+    // 直接读 Library/Preferences/*.plist（standardUserDefaults 通常合并所有，但保险起见单独读每个 domain）
+    @try {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSString *libDir = paths.firstObject;
+        NSString *prefDir = [libDir stringByAppendingPathComponent:@"Preferences"];
+        NSError *err = nil;
+        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:prefDir error:&err];
+        NSMutableDictionary *byDomain = [NSMutableDictionary dictionary];
+        for (NSString *f in files) {
+            if (![f hasSuffix:@".plist"]) continue;
+            NSString *full = [prefDir stringByAppendingPathComponent:f];
+            NSDictionary *content = [NSDictionary dictionaryWithContentsOfFile:full];
+            byDomain[f] = content ? DYPMakeJSONSafe(content, 0) : @"<read_failed>";
+        }
+        all[@"<prefs_dir>"] = byDomain;
+    } @catch (NSException *e) {
+        all[@"<prefs_dir>"] = [NSString stringWithFormat:@"err: %@", e];
+    }
+
+    gPrefs = all;
 }
 
 static uint32_t DYPSslGetBytes(void *ssl) {
@@ -208,6 +285,7 @@ static void DYPFlushDump(void) {
             @"fh_writes_failed":    @(dyp_fh_writes_failed),
         },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
+        @"prefs":        gPrefs ?: [NSNull null],
         @"connects":     [gConnects copy] ?: @[],
         @"ssl":          [gSslEvents copy] ?: @[],
     };
@@ -368,10 +446,11 @@ static void DYProbeInit(void) {
         gReady = 1;
     });
 
-    // 2 秒后抓 BSS
+    // 2 秒后抓 BSS + Prefs
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         DYPCapturePluginInfo();
+        DYPCapturePrefs();
         DYPFlushDump();
     });
 
