@@ -107,14 +107,26 @@ static void DYPFlushDump(void) {
 
 #pragma mark - Plugin module discovery
 
+// 作者插件叫 libswiftMetal.dylib，但 Apple 系统也有同名的
+// /usr/lib/swift/libswiftMetal.dylib (Metal Swift bindings)，所以必须用
+// 完整路径过滤：只接受 *.app/Frameworks/* 下的命中。
+static BOOL DYPIsPluginPath(NSString *full) {
+    if (!full) return NO;
+    if ([full hasPrefix:@"/usr/lib/"]) return NO;
+    if ([full hasPrefix:@"/System/"])  return NO;
+    if ([full rangeOfString:@".app/Frameworks/"].location == NSNotFound) return NO;
+    NSString *base = full.lastPathComponent;
+    return [base isEqualToString:DYP_PLUGIN_NAME_1] || [base isEqualToString:DYP_PLUGIN_NAME_2];
+}
+
 static void DYPCapturePluginInfo(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         NSString *full = [NSString stringWithUTF8String:name];
-        NSString *base = full.lastPathComponent;
-        if ([base isEqualToString:DYP_PLUGIN_NAME_1] || [base isEqualToString:DYP_PLUGIN_NAME_2]) {
+        if (DYPIsPluginPath(full)) {
+            NSString *base = full.lastPathComponent;
             const struct mach_header *mh = _dyld_get_image_header(i);
             intptr_t slide = _dyld_get_image_vmaddr_slide(i);
             uintptr_t baseAddr = (uintptr_t)mh;
