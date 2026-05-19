@@ -39,6 +39,12 @@ struct rebindings_entry {
 
 static struct rebindings_entry *_rebindings_head;
 
+// 诊断（DYProbe.m 可从外部读）
+int dyp_fh_images_scanned = 0;
+int dyp_fh_sections_scanned = 0;
+int dyp_fh_symbols_matched = 0;
+int dyp_fh_writes_failed = 0;
+
 static int prepend_rebindings(struct rebindings_entry **head,
                               struct rebinding rebs[], size_t nel) {
     struct rebindings_entry *e = (struct rebindings_entry *)malloc(sizeof(*e));
@@ -71,12 +77,18 @@ static int dyp_write_pointer(void **slot, void *value) {
     return 0;
 }
 
+extern int dyp_fh_writes_failed;
+
+extern int dyp_fh_sections_scanned;
+extern int dyp_fh_symbols_matched;
+
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
                                            nlist_t *symtab,
                                            char *strtab,
                                            uint32_t *indirect_symtab) {
+    dyp_fh_sections_scanned++;
     uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
     void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
     for (uint32_t i = 0; i < section->size / sizeof(void *); i++) {
@@ -90,11 +102,14 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         while (cur) {
             for (uint32_t j = 0; j < cur->rebindings_nel; j++) {
                 if (strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
+                    dyp_fh_symbols_matched++;
                     if (cur->rebindings[j].replaced != NULL &&
                         indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
                         *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
                     }
-                    dyp_write_pointer(&indirect_symbol_bindings[i], cur->rebindings[j].replacement);
+                    if (dyp_write_pointer(&indirect_symbol_bindings[i], cur->rebindings[j].replacement) != 0) {
+                        dyp_fh_writes_failed++;
+                    }
                     goto symbol_loop;
                 }
             }
@@ -104,9 +119,12 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
     }
 }
 
+extern int dyp_fh_images_scanned;
+
 static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
                                      intptr_t slide) {
+    dyp_fh_images_scanned++;
     Dl_info info;
     if (dladdr(header, &info) == 0) return;
 
