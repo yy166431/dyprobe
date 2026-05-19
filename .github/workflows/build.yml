@@ -31,30 +31,30 @@ jobs:
             -mios-version-min=14.0 \
             -fobjc-arc \
             -dynamiclib \
-            -install_name "@rpath/libNetSnoop.dylib" \
+            -install_name "@rpath/libAweTrace.dylib" \
             -framework Foundation \
             -framework CoreFoundation \
             -lobjc \
             -O2 \
             -Wno-deprecated-declarations \
             DYProbe.m \
-            -o libNetSnoop.dylib
+            -o libAweTrace.dylib
 
       - name: Codesign with ldid (fake-sign)
         run: |
-          ldid -S libNetSnoop.dylib
-          file libNetSnoop.dylib
-          ls -la libNetSnoop.dylib
+          ldid -S libAweTrace.dylib
+          file libAweTrace.dylib
+          ls -la libAweTrace.dylib
 
       - name: Verify Mach-O
         run: |
-          otool -hv libNetSnoop.dylib
-          otool -L libNetSnoop.dylib
-          dwarfdump --uuid libNetSnoop.dylib
+          otool -hv libAweTrace.dylib
+          otool -L libAweTrace.dylib
+          dwarfdump --uuid libAweTrace.dylib
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libNetSnoop
-          path: libNetSnoop.dylib
+          name: libAweTrace
+          path: libAweTrace.dylib
           if-no-files-found: error
