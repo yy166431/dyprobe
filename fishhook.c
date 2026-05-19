@@ -1,10 +1,14 @@
-// Facebook fishhook 简化版
+// Facebook fishhook 简化版 + iOS 16 __DATA_CONST 写保护绕过
 // https://github.com/facebook/fishhook
 #include "fishhook.h"
 #include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <mach/mach.h>
+#include <mach/mach_init.h>
+#include <mach/vm_map.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -48,6 +52,29 @@ static int prepend_rebindings(struct rebindings_entry **head,
     return 0;
 }
 
+// iOS 16+ __DATA_CONST 段是只读的，写之前要 mach vm_protect 临时改成可写
+static int dyp_write_pointer(void **slot, void *value) {
+    // 先尝试直接写（旧 iOS / __DATA 段够用）
+    // 用 vm_protect 给一页改成 RW
+    uintptr_t addr = (uintptr_t)slot;
+    uintptr_t page = addr & ~((uintptr_t)0xFFF);
+    kern_return_t kr = vm_protect(mach_task_self(),
+                                   (vm_address_t)page,
+                                   0x1000,
+                                   FALSE,
+                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        // 退而求其次：mprotect
+        if (mprotect((void *)page, 0x1000, PROT_READ | PROT_WRITE) != 0) {
+            return -1;
+        }
+    }
+    *slot = value;
+    // 写完后不强制改回只读：iOS 上保留 RW 不会影响功能（只是少一道防御），
+    // 但改回去经常失败会导致后续 hook 写不进去，所以这里就保持 RW
+    return 0;
+}
+
 static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
@@ -71,7 +98,8 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                         indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
                         *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
                     }
-                    indirect_symbol_bindings[i] = cur->rebindings[j].replacement;
+                    // iOS 16: __DATA_CONST 写保护，改用 vm_protect+写
+                    dyp_write_pointer(&indirect_symbol_bindings[i], cur->rebindings[j].replacement);
                     goto symbol_loop;
                 }
             }
@@ -80,6 +108,75 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         symbol_loop:;
     }
 }
+
+static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
+                                     const struct mach_header *header,
+                                     intptr_t slide) {
+    Dl_info info;
+    if (dladdr(header, &info) == 0) return;
+
+    segment_command_t *cur_seg_cmd;
+    segment_command_t *linkedit_segment = NULL;
+    struct symtab_command *symtab_cmd = NULL;
+    struct dysymtab_command *dysymtab_cmd = NULL;
+
+    uintptr_t cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+            if (strcmp(cur_seg_cmd->segname, SEG_LINKEDIT) == 0) {
+                linkedit_segment = cur_seg_cmd;
+            }
+        } else if (cur_seg_cmd->cmd == LC_SYMTAB) {
+            symtab_cmd = (struct symtab_command *)cur_seg_cmd;
+        } else if (cur_seg_cmd->cmd == LC_DYSYMTAB) {
+            dysymtab_cmd = (struct dysymtab_command *)cur_seg_cmd;
+        }
+    }
+
+    if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment ||
+        !dysymtab_cmd->nindirectsyms) return;
+
+    uintptr_t linkedit_base = (uintptr_t)slide + linkedit_segment->vmaddr - linkedit_segment->fileoff;
+    nlist_t *symtab = (nlist_t *)(linkedit_base + symtab_cmd->symoff);
+    char *strtab = (char *)(linkedit_base + symtab_cmd->stroff);
+    uint32_t *indirect_symtab = (uint32_t *)(linkedit_base + dysymtab_cmd->indirectsymoff);
+
+    cur = (uintptr_t)header + sizeof(mach_header_t);
+    for (uint32_t i = 0; i < header->ncmds; i++, cur += cur_seg_cmd->cmdsize) {
+        cur_seg_cmd = (segment_command_t *)cur;
+        if (cur_seg_cmd->cmd == LC_SEGMENT_ARCH_DEPENDENT) {
+            if (strcmp(cur_seg_cmd->segname, SEG_DATA) != 0 &&
+                strcmp(cur_seg_cmd->segname, SEG_DATA_CONST) != 0) continue;
+            for (uint32_t j = 0; j < cur_seg_cmd->nsects; j++) {
+                section_t *sect = (section_t *)(cur + sizeof(segment_command_t)) + j;
+                if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS ||
+                    (sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
+                    perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+                }
+            }
+        }
+    }
+}
+
+static void _rebind_symbols_for_image(const struct mach_header *header, intptr_t slide) {
+    rebind_symbols_for_image(_rebindings_head, header, slide);
+}
+
+int rebind_symbols(struct rebinding rebindings[], size_t rebindings_nel) {
+    int retval = prepend_rebindings(&_rebindings_head, rebindings, rebindings_nel);
+    if (retval < 0) return retval;
+    if (!_rebindings_head->next) {
+        _dyld_register_func_for_add_image(_rebind_symbols_for_image);
+    } else {
+        uint32_t c = _dyld_image_count();
+        for (uint32_t i = 0; i < c; i++) {
+            _rebind_symbols_for_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i));
+        }
+    }
+    return retval;
+}
+
 
 static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
