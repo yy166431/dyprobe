@@ -23,6 +23,7 @@
 #import <unistd.h>
 #import <string.h>
 #import <errno.h>
+#import <Security/Security.h>
 #include "fishhook.h"
 
 #define DYP_MAX_CONNECT_EVENTS  512
@@ -41,6 +42,7 @@ static NSDictionary  *gMeta        = nil;
 static NSString      *gBssHex      = nil;
 static NSString      *gBssBase     = nil;
 static NSDictionary  *gPrefs       = nil;  // NSUserDefaults dump
+static NSDictionary  *gKeychain    = nil;  // Keychain dump
 static int            gConnectCount= 0;
 static int            gSslEventCount= 0;
 static pthread_mutex_t gLock;
@@ -164,7 +166,7 @@ static void DYPCapturePrefs(void) {
         all[@"<standardUserDefaults>"] = [NSString stringWithFormat:@"err: %@", e];
     }
 
-    // 直接读 Library/Preferences/*.plist（standardUserDefaults 通常合并所有，但保险起见单独读每个 domain）
+    // 直接读 Library/Preferences/*.plist
     @try {
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
         NSString *libDir = paths.firstObject;
@@ -183,7 +185,107 @@ static void DYPCapturePrefs(void) {
         all[@"<prefs_dir>"] = [NSString stringWithFormat:@"err: %@", e];
     }
 
+    // 沙盒文件树扫描：Documents/ + Library/（排除大目录如 Caches）
+    @try {
+        NSArray *docPaths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSArray *libPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSMutableArray *roots = [NSMutableArray array];
+        if (docPaths.firstObject) [roots addObject:docPaths.firstObject];
+        if (libPaths.firstObject) [roots addObject:libPaths.firstObject];
+
+        NSMutableArray *fileList = [NSMutableArray array];
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        for (NSString *root in roots) {
+            NSDirectoryEnumerator *e = [fm enumeratorAtPath:root];
+            NSString *rel;
+            while ((rel = [e nextObject])) {
+                NSString *full = [root stringByAppendingPathComponent:rel];
+                // 排除大目录
+                if ([rel hasPrefix:@"Caches/"] || [rel hasPrefix:@"WebKit/"] ||
+                    [rel hasPrefix:@"HTTPStorages/"] || [rel hasPrefix:@"Cookies/"]) {
+                    [e skipDescendents];
+                    continue;
+                }
+                NSDictionary *attrs = [e fileAttributes];
+                BOOL isDir = [attrs[NSFileType] isEqualToString:NSFileTypeDirectory];
+                if (isDir) continue;
+                unsigned long long fsize = [attrs[NSFileSize] unsignedLongLongValue];
+                // 跳过 > 1MB 的文件（业务缓存，不是配置）
+                if (fsize > 1024*1024) {
+                    [fileList addObject:@{@"path": rel, @"size": @(fsize), @"<skipped>": @"too_large"}];
+                    continue;
+                }
+                // 读小文件内容
+                NSData *data = [NSData dataWithContentsOfFile:full];
+                NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+                entry[@"path"] = rel;
+                entry[@"size"] = @(fsize);
+                if (data) {
+                    // 尝试作为 plist 解析
+                    NSError *plistErr = nil;
+                    id plistObj = [NSPropertyListSerialization propertyListWithData:data
+                                                                            options:0
+                                                                             format:NULL
+                                                                              error:&plistErr];
+                    if (plistObj) {
+                        entry[@"plist"] = DYPMakeJSONSafe(plistObj, 0);
+                    } else {
+                        // 不是 plist，dump 前 4KB 的 hex+ascii
+                        NSUInteger n = MIN(data.length, (NSUInteger)4096);
+                        const unsigned char *bytes = data.bytes;
+                        NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
+                        NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
+                        for (NSUInteger i = 0; i < n; i++) {
+                            [hex appendFormat:@"%02x", bytes[i]];
+                            unsigned char c = bytes[i];
+                            [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
+                        }
+                        entry[@"raw_hex"] = hex;
+                        entry[@"raw_ascii"] = ascii;
+                    }
+                }
+                [fileList addObject:entry];
+            }
+        }
+        all[@"<sandbox_files>"] = fileList;
+    } @catch (NSException *e) {
+        all[@"<sandbox_files>"] = [NSString stringWithFormat:@"err: %@", e];
+    }
+
     gPrefs = all;
+}
+
+// 枚举 4 类 Keychain 项
+static void DYPCaptureKeychain(void) {
+    NSMutableDictionary *all = [NSMutableDictionary dictionary];
+    NSArray *classes = @[(__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecClassInternetPassword,
+                         (__bridge id)kSecClassCertificate,
+                         (__bridge id)kSecClassKey];
+    NSArray *classNames = @[@"GenericPassword", @"InternetPassword", @"Certificate", @"Key"];
+
+    for (NSUInteger ci = 0; ci < classes.count; ci++) {
+        NSDictionary *q = @{
+            (__bridge id)kSecClass: classes[ci],
+            (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes: @YES,
+            (__bridge id)kSecReturnData: @YES,
+        };
+        CFTypeRef result = NULL;
+        OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &result);
+        if (st == errSecSuccess && result) {
+            NSArray *items = (__bridge_transfer NSArray *)result;
+            NSMutableArray *out = [NSMutableArray array];
+            for (NSDictionary *it in items) {
+                [out addObject:DYPMakeJSONSafe(it, 0) ?: [NSNull null]];
+            }
+            all[classNames[ci]] = out;
+        } else {
+            all[classNames[ci]] = [NSString stringWithFormat:@"<empty or err %d>", (int)st];
+        }
+    }
+    gKeychain = all;
 }
 
 static uint32_t DYPSslGetBytes(void *ssl) {
@@ -286,6 +388,7 @@ static void DYPFlushDump(void) {
         },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
         @"prefs":        gPrefs ?: [NSNull null],
+        @"keychain":     gKeychain ?: [NSNull null],
         @"connects":     [gConnects copy] ?: @[],
         @"ssl":          [gSslEvents copy] ?: @[],
     };
@@ -446,11 +549,12 @@ static void DYProbeInit(void) {
         gReady = 1;
     });
 
-    // 2 秒后抓 BSS + Prefs
+    // 2 秒后抓 BSS + Prefs + Keychain
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         DYPCapturePluginInfo();
         DYPCapturePrefs();
+        DYPCaptureKeychain();
         DYPFlushDump();
     });
 
