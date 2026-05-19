@@ -1,13 +1,14 @@
 //
-// DYProbe.m  — 极简版：只 hook connect，dump 所有 outbound TCP IP/port
+// DYProbe.m  — fishhook 版
 //
-// 之前 hook read/write/close 会跟 dyld 自己的 IO 撞死，导致抖音启动闪退。
-// 这版只 hook connect 一个函数，最小侵入。
+// fishhook 替换 __la_symbol_ptr 段里的指针，data 段写入，绕开 PAC + interpose 递归坑。
 //
-// 输出：
-//   - connects[]：所有 TCP outbound 连接 (ip, port, ts)
-//     用来确认作者后端 IP 是什么（106.53.173.140 / 还是换了？）
-//   - bss_snapshot：libswiftMetal.dylib BSS 64KB 快照
+// hook 目标：
+//   - connect: 抓所有 outbound TCP IP/port
+//   - SSL_write: 抓 boringssl 加密前的明文（HTTPS 请求 body）
+//   - SSL_read: 抓 boringssl 解密后的明文（HTTPS 响应 body）
+//
+// 输出 /var/mobile/.../Documents/dyprobe_dump.json
 //
 
 #import <Foundation/Foundation.h>
@@ -22,75 +23,72 @@
 #import <unistd.h>
 #import <string.h>
 #import <errno.h>
+#include "fishhook.h"
 
 #define DYP_MAX_CONNECT_EVENTS  512
+#define DYP_MAX_SSL_EVENTS      64
 #define DYP_BSS_SIZE            0x10000
+#define DYP_BUF_CAP             8192
+#define DYP_PER_FD_MAX_BYTES    32768
 #define DYP_PLUGIN_NAME_1 @"libswiftMetal.dylib"
 #define DYP_PLUGIN_NAME_2 @"libswiftMetal_patched.dylib"
-
-#define DYLD_INTERPOSE(_replacement, _replacee) \
-    __attribute__((used)) static struct { \
-        const void *replacement; \
-        const void *replacee; \
-    } _interpose_##_replacee \
-    __attribute__((section("__DATA,__interpose"))) = { \
-        (const void *)(unsigned long)&_replacement, \
-        (const void *)(unsigned long)&_replacee \
-    };
 
 #pragma mark - 全局状态
 
 static NSMutableArray *gConnects   = nil;
+static NSMutableArray *gSslEvents  = nil;
 static NSDictionary  *gMeta        = nil;
 static NSString      *gBssHex      = nil;
 static NSString      *gBssBase     = nil;
 static int            gConnectCount= 0;
+static int            gSslEventCount= 0;
 static pthread_mutex_t gLock;
 static NSString      *gOutputPath  = nil;
 static volatile int   gReady       = 0;
 
-static int gDiagConnectCalls = 0;
+// per-SSL-pointer 字节计数（防爆，每条 SSL* 最多抓 32KB）
+#define DYP_MAX_SSL_TRACK 64
+static struct {
+    void *ssl;
+    uint32_t bytes;
+} gSslTrack[DYP_MAX_SSL_TRACK];
 
-#pragma mark - 原 connect 指针
+static int gDiagConnectCalls = 0;
+static int gDiagSslWriteCalls = 0;
+static int gDiagSslReadCalls  = 0;
+
+#pragma mark - 原函数指针
 
 typedef int (*connect_fn)(int, const struct sockaddr *, socklen_t);
-static connect_fn g_orig_connect = NULL;
+typedef int (*SSL_write_fn)(void *ssl, const void *buf, int num);
+typedef int (*SSL_read_fn)(void *ssl, void *buf, int num);
 
-// iOS / macOS 直接发 BSD syscall connect (SYS_connect = 98)，
-// 绕过 libsystem 完全避开 DYLD_INTERPOSE 拦截（dlopen + dlsym 也会被拦）。
-// errno 由内核通过 carry flag + x0 返回值约定设置。
-//
-// ABI: x0=fd, x1=sockaddr*, x2=socklen, x16=syscall number, svc #0x80
-// 返回：x0 = 0 成功 / -errno 失败（按 darwin 约定，carry set 表示出错）
-
-static int dyp_raw_connect(int fd, const struct sockaddr *addr, socklen_t len) {
-    register long x0 __asm__("x0") = (long)fd;
-    register long x1 __asm__("x1") = (long)addr;
-    register long x2 __asm__("x2") = (long)len;
-    register long x16 __asm__("x16") = 98;  // SYS_connect
-    __asm__ volatile (
-        "svc #0x80"
-        : "+r"(x0)
-        : "r"(x1), "r"(x2), "r"(x16)
-        : "memory", "cc"
-    );
-    // x0 < 0 表示 -errno，但 darwin 实际通过 carry flag 判断
-    // 这里粗略处理：负值视为错误
-    if (x0 < 0) {
-        errno = (int)(-x0);
-        return -1;
-    }
-    return (int)x0;
-}
+static connect_fn   g_orig_connect   = NULL;
+static SSL_write_fn g_orig_SSL_write = NULL;
+static SSL_read_fn  g_orig_SSL_read  = NULL;
 
 #pragma mark - Helpers
 
 static BOOL DYPShouldIgnoreIP(uint32_t ipBE) {
     uint32_t ip = ntohl(ipBE);
-    if ((ip & 0xFF000000) == 0x7F000000) return YES;  // 127/8
-    if ((ip & 0xFFFF0000) == 0xA9FE0000) return YES;  // 169.254/16
+    if ((ip & 0xFF000000) == 0x7F000000) return YES;
+    if ((ip & 0xFFFF0000) == 0xA9FE0000) return YES;
     if (ip == 0) return YES;
     return NO;
+}
+
+static NSDictionary *DYPDataInfo(const void *buf, size_t len) {
+    if (!buf || len == 0) return @{@"len": @(len)};
+    size_t n = MIN(len, (size_t)DYP_BUF_CAP);
+    const unsigned char *bytes = (const unsigned char *)buf;
+    NSMutableString *hex = [NSMutableString stringWithCapacity:n*2];
+    NSMutableString *ascii = [NSMutableString stringWithCapacity:n];
+    for (size_t i = 0; i < n; i++) {
+        [hex appendFormat:@"%02x", bytes[i]];
+        unsigned char c = bytes[i];
+        [ascii appendFormat:@"%c", (c >= 32 && c < 127) ? c : '.'];
+    }
+    return @{@"len": @(len), @"captured": @(n), @"hex": hex, @"ascii": ascii};
 }
 
 static NSString *DYPDocPath(void) {
@@ -98,6 +96,29 @@ static NSString *DYPDocPath(void) {
     NSString *doc = paths.firstObject;
     if (!doc) doc = @"/var/mobile/Documents";
     return [doc stringByAppendingPathComponent:@"dyprobe_dump.json"];
+}
+
+static uint32_t DYPSslGetBytes(void *ssl) {
+    for (int i = 0; i < DYP_MAX_SSL_TRACK; i++) {
+        if (gSslTrack[i].ssl == ssl) return gSslTrack[i].bytes;
+    }
+    return 0;
+}
+
+static void DYPSslAddBytes(void *ssl, uint32_t add) {
+    for (int i = 0; i < DYP_MAX_SSL_TRACK; i++) {
+        if (gSslTrack[i].ssl == ssl) {
+            gSslTrack[i].bytes += add;
+            return;
+        }
+    }
+    for (int i = 0; i < DYP_MAX_SSL_TRACK; i++) {
+        if (gSslTrack[i].ssl == NULL) {
+            gSslTrack[i].ssl = ssl;
+            gSslTrack[i].bytes = add;
+            return;
+        }
+    }
 }
 
 static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE, int family) {
@@ -127,17 +148,45 @@ static void DYPAddConnectEvent(int fd, uint32_t ipBE, uint16_t portHE, int famil
     pthread_mutex_unlock(&gLock);
 }
 
+static void DYPAddSslEvent(NSString *op, void *ssl, const void *buf, int len) {
+    if (len <= 0) return;
+    if (DYPSslGetBytes(ssl) >= DYP_PER_FD_MAX_BYTES) return;
+    pthread_mutex_lock(&gLock);
+    if (gSslEventCount >= DYP_MAX_SSL_EVENTS) {
+        pthread_mutex_unlock(&gLock);
+        return;
+    }
+    gSslEventCount++;
+    pthread_mutex_unlock(&gLock);
+
+    DYPSslAddBytes(ssl, (uint32_t)len);
+    NSDictionary *info = DYPDataInfo(buf, (size_t)len);
+    NSDictionary *e = @{
+        @"ssl": [NSString stringWithFormat:@"%p", ssl],
+        @"op":  op,
+        @"data": info,
+        @"ts":  @([[NSDate date] timeIntervalSince1970]),
+    };
+    pthread_mutex_lock(&gLock);
+    [gSslEvents addObject:e];
+    pthread_mutex_unlock(&gLock);
+}
+
 static void DYPFlushDump(void) {
     pthread_mutex_lock(&gLock);
     NSDictionary *out = @{
         @"meta":         gMeta ?: @{},
         @"diag":         @{
-            @"ready":          @(gReady),
-            @"connect_calls":  @(gDiagConnectCalls),
-            @"connect_events": @(gConnectCount),
+            @"ready":           @(gReady),
+            @"connect_calls":   @(gDiagConnectCalls),
+            @"ssl_write_calls": @(gDiagSslWriteCalls),
+            @"ssl_read_calls":  @(gDiagSslReadCalls),
+            @"connect_events":  @(gConnectCount),
+            @"ssl_events":      @(gSslEventCount),
         },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
         @"connects":     [gConnects copy] ?: @[],
+        @"ssl":          [gSslEvents copy] ?: @[],
     };
     NSError *err = nil;
     NSData *json = [NSJSONSerialization dataWithJSONObject:out
@@ -149,13 +198,13 @@ static void DYPFlushDump(void) {
     pthread_mutex_unlock(&gLock);
 }
 
-#pragma mark - INTERPOSE: connect only
+#pragma mark - Hook 实现
 
-int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
-    // 直接发 syscall，绕开 DYLD_INTERPOSE，避免无限递归
-    int rv = dyp_raw_connect(fd, addr, len);
+// 注意：fishhook 是替换 __la_symbol_ptr，所以"原函数"被存到 g_orig_xxx，
+// hook 调用 g_orig_xxx 不会递归（因为指向真实 libsystem/boringssl 实现）
 
-    // 只在 gReady 且 ObjC runtime 准备好后才记录
+static int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
+    int rv = g_orig_connect ? g_orig_connect(fd, addr, len) : -1;
     if (!gReady || !gConnects) return rv;
 
     gDiagConnectCalls++;
@@ -172,7 +221,27 @@ int dyp_connect(int fd, const struct sockaddr *addr, socklen_t len) {
     }
     return rv;
 }
-DYLD_INTERPOSE(dyp_connect, connect);
+
+static int dyp_SSL_write(void *ssl, const void *buf, int num) {
+    int rv = g_orig_SSL_write ? g_orig_SSL_write(ssl, buf, num) : 0;
+    if (!gReady || !gSslEvents) return rv;
+    gDiagSslWriteCalls++;
+    // 只记成功的写入
+    if (rv > 0) {
+        DYPAddSslEvent(@"SSL_write", ssl, buf, num);
+    }
+    return rv;
+}
+
+static int dyp_SSL_read(void *ssl, void *buf, int num) {
+    int rv = g_orig_SSL_read ? g_orig_SSL_read(ssl, buf, num) : 0;
+    if (!gReady || !gSslEvents) return rv;
+    gDiagSslReadCalls++;
+    if (rv > 0) {
+        DYPAddSslEvent(@"SSL_read", ssl, buf, rv);
+    }
+    return rv;
+}
 
 #pragma mark - Plugin BSS dump
 
@@ -248,19 +317,25 @@ static void DYPCapturePluginInfo(void) {
 
 #pragma mark - Entry
 
-__attribute__((constructor(101)))
-static void DYProbeResolveSymbols(void) {
-    // 不需要解析符号了，dyp_connect 直接用 svc 发 syscall。
-    // 这个 constructor 保留只是为了占位（早期 init），可能将来加诊断
-}
-
 __attribute__((constructor))
 static void DYProbeInit(void) {
     pthread_mutex_init(&gLock, NULL);
     gConnects = [[NSMutableArray alloc] init];
+    gSslEvents = [[NSMutableArray alloc] init];
     gOutputPath = DYPDocPath();
+    memset(gSslTrack, 0, sizeof(gSslTrack));
 
-    // 1.5 秒后开 ready，给抖音启动期一点缓冲（实测 5s 太久）
+    // fishhook 重绑定：连同 boringssl 在内的所有 image 的 __la_symbol_ptr
+    // 里凡是 connect/SSL_write/SSL_read 的引用，都改成我们的 dyp_xxx
+    // g_orig_xxx 会被 fishhook 写入指向真实实现的指针
+    struct rebinding rebs[3] = {
+        {"connect",   (void *)dyp_connect,   (void **)&g_orig_connect},
+        {"SSL_write", (void *)dyp_SSL_write, (void **)&g_orig_SSL_write},
+        {"SSL_read",  (void *)dyp_SSL_read,  (void **)&g_orig_SSL_read},
+    };
+    rebind_symbols(rebs, 3);
+
+    // 1.5 秒后 ready
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
         gReady = 1;
