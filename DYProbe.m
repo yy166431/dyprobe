@@ -97,6 +97,13 @@ static void DYPFlushDump(void) {
     pthread_mutex_lock(&gLock);
     NSDictionary *out = @{
         @"meta":         gMeta ?: @{},
+        @"diag":         @{
+            @"subclass_count":     @(gDiagSubclassCount),
+            @"data_hook_calls":    @(gDiagDataHookCount),
+            @"upload_hook_calls":  @(gDiagUploadHookCount),
+            @"resume_hook_calls":  @(gDiagResumeHookCount),
+            @"resume_hit_target":  @(gDiagResumeHitTarget),
+        },
         @"bss_snapshot": gBssHex ? @{@"base": gBssBase ?: @"", @"size": @(DYP_BSS_SIZE), @"hex": gBssHex} : [NSNull null],
         @"requests":     [gRequests copy] ?: @[],
         @"completions":  [gCompletions copy] ?: @[],
@@ -199,8 +206,30 @@ static void DYPCapturePluginInfo(void) {
 
 typedef void (^DYPCompletionBlock)(NSData *, NSURLResponse *, NSError *);
 
-static IMP gOrig_dataTaskWithRequest_completion = NULL;
-static IMP gOrig_uploadTaskWithRequest_fromData_completion = NULL;
+// Hook 设计说明：
+// NSURLSession 是 class cluster，调用方用 NSURLSession 父类指针拿到的实际是
+// __NSURLSessionLocal / __NSCFURLLocalSession 等私有子类。class_getInstanceMethod
+// 在父类上拿不到子类的 IMP 重写 → swizzle 父类对子类调用无效。
+//
+// 解决方案：
+//   1) 遍历 objc 类列表，把 NSURLSession 所有子类都 swizzle 一遍
+//   2) Hook NSURLSessionTask -resume：所有 task 类型最终都调它，覆盖率 100%
+//   3) 通过 task 的 currentRequest / originalRequest 拿 URL，KVO 监听 state 拿响应
+
+static IMP gOrig_dataTask_completion = NULL;
+static IMP gOrig_uploadTask_completion = NULL;
+static IMP gOrig_taskResume = NULL;
+
+// 已 swizzle 过的 class 集合（避免重复）
+static NSMutableSet *gSwizzledClasses = nil;
+
+static int  gDiagSubclassCount = 0;
+static int  gDiagDataHookCount = 0;
+static int  gDiagUploadHookCount = 0;
+static int  gDiagResumeHookCount = 0;
+static int  gDiagResumeHitTarget = 0;
+
+static NSMutableDictionary *gTaskMap = nil;  // task pointer -> reqIdx (NSNumber)
 
 // 通用：包装 completionHandler 用，captures reqIdx + url
 static DYPCompletionBlock DYPWrapCompletion(int reqIdx, NSString *url, DYPCompletionBlock orig) {
@@ -267,6 +296,7 @@ static int DYPRecordRequest(NSURLRequest *request, NSString *kind, NSData *uploa
 
 - (NSURLSessionDataTask *)dyp_dataTaskWithRequest:(NSURLRequest *)request
                                 completionHandler:(DYPCompletionBlock)completionHandler {
+    gDiagDataHookCount++;
     @try {
         NSString *host = request.URL.host;
         if (host && [host isEqualToString:DYP_TARGET_HOST]) {
@@ -275,19 +305,20 @@ static int DYPRecordRequest(NSURLRequest *request, NSString *kind, NSData *uploa
             DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
 
             typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
-            Fn fn = (Fn)gOrig_dataTaskWithRequest_completion;
+            Fn fn = (Fn)gOrig_dataTask_completion;
             return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, wrapped);
         }
     } @catch (NSException *e) {}
 
     typedef NSURLSessionDataTask *(*Fn)(id, SEL, NSURLRequest *, DYPCompletionBlock);
-    Fn fn = (Fn)gOrig_dataTaskWithRequest_completion;
+    Fn fn = (Fn)gOrig_dataTask_completion;
     return fn(self, @selector(dyp_dataTaskWithRequest:completionHandler:), request, completionHandler);
 }
 
 - (NSURLSessionUploadTask *)dyp_uploadTaskWithRequest:(NSURLRequest *)request
                                              fromData:(NSData *)bodyData
                                     completionHandler:(DYPCompletionBlock)completionHandler {
+    gDiagUploadHookCount++;
     @try {
         NSString *host = request.URL.host;
         if (host && [host isEqualToString:DYP_TARGET_HOST]) {
@@ -296,14 +327,58 @@ static int DYPRecordRequest(NSURLRequest *request, NSString *kind, NSData *uploa
             DYPCompletionBlock wrapped = completionHandler ? DYPWrapCompletion(reqIdx, url, completionHandler) : nil;
 
             typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
-            Fn fn = (Fn)gOrig_uploadTaskWithRequest_fromData_completion;
+            Fn fn = (Fn)gOrig_uploadTask_completion;
             return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, wrapped);
         }
     } @catch (NSException *e) {}
 
     typedef NSURLSessionUploadTask *(*Fn)(id, SEL, NSURLRequest *, NSData *, DYPCompletionBlock);
-    Fn fn = (Fn)gOrig_uploadTaskWithRequest_fromData_completion;
+    Fn fn = (Fn)gOrig_uploadTask_completion;
     return fn(self, @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:), request, bodyData, completionHandler);
+}
+
+@end
+
+#pragma mark - NSURLSessionTask -resume hook
+
+@interface NSURLSessionTask (DYProbe) @end
+@implementation NSURLSessionTask (DYProbe)
+
+- (void)dyp_resume {
+    gDiagResumeHookCount++;
+    @try {
+        // task 自己有 currentRequest / originalRequest
+        NSURLRequest *req = nil;
+        if ([self respondsToSelector:@selector(originalRequest)]) {
+            req = [(id)self performSelector:@selector(originalRequest)];
+        }
+        if (!req && [self respondsToSelector:@selector(currentRequest)]) {
+            req = [(id)self performSelector:@selector(currentRequest)];
+        }
+        if (req) {
+            NSString *host = req.URL.host;
+            if (host && [host isEqualToString:DYP_TARGET_HOST]) {
+                gDiagResumeHitTarget++;
+                // 只记录一次（基于 task 指针 dedup）
+                NSValue *key = [NSValue valueWithPointer:(__bridge void *)self];
+                pthread_mutex_lock(&gLock);
+                BOOL alreadySeen = (gTaskMap[key] != nil);
+                pthread_mutex_unlock(&gLock);
+
+                if (!alreadySeen) {
+                    NSString *kind = NSStringFromClass([self class]);
+                    int reqIdx = DYPRecordRequest(req, kind, nil);
+                    pthread_mutex_lock(&gLock);
+                    gTaskMap[key] = @(reqIdx);
+                    pthread_mutex_unlock(&gLock);
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+
+    typedef void (*Fn)(id, SEL);
+    Fn fn = (Fn)gOrig_taskResume;
+    fn(self, @selector(dyp_resume));
 }
 
 @end
@@ -326,17 +401,77 @@ static void DYPSwizzleOne(Class cls, SEL origSel, SEL newSel, IMP *outOrigIMP) {
     }
 }
 
+// 遍历所有 NSURLSession 子类，逐个 swizzle
+static void DYPSwizzleSessionSubclass(Class cls) {
+    NSString *name = NSStringFromClass(cls);
+    NSValue *key = [NSValue valueWithPointer:(__bridge void *)cls];
+    if ([gSwizzledClasses containsObject:key]) return;
+    [gSwizzledClasses addObject:key];
+    gDiagSubclassCount++;
+
+    // dataTask
+    Method dataM = class_getInstanceMethod(cls, @selector(dataTaskWithRequest:completionHandler:));
+    if (dataM) {
+        IMP origIMP = NULL;
+        DYPSwizzleOne(cls,
+                      @selector(dataTaskWithRequest:completionHandler:),
+                      @selector(dyp_dataTaskWithRequest:completionHandler:),
+                      &origIMP);
+        if (origIMP && !gOrig_dataTask_completion) {
+            gOrig_dataTask_completion = origIMP;
+        }
+    }
+
+    // uploadTask
+    Method uploadM = class_getInstanceMethod(cls, @selector(uploadTaskWithRequest:fromData:completionHandler:));
+    if (uploadM) {
+        IMP origIMP = NULL;
+        DYPSwizzleOne(cls,
+                      @selector(uploadTaskWithRequest:fromData:completionHandler:),
+                      @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:),
+                      &origIMP);
+        if (origIMP && !gOrig_uploadTask_completion) {
+            gOrig_uploadTask_completion = origIMP;
+        }
+    }
+}
+
 static void DYPInstallSwizzle(void) {
-    Class cls = NSClassFromString(@"NSURLSession");
-    if (!cls) return;
-    DYPSwizzleOne(cls,
-                  @selector(dataTaskWithRequest:completionHandler:),
-                  @selector(dyp_dataTaskWithRequest:completionHandler:),
-                  &gOrig_dataTaskWithRequest_completion);
-    DYPSwizzleOne(cls,
-                  @selector(uploadTaskWithRequest:fromData:completionHandler:),
-                  @selector(dyp_uploadTaskWithRequest:fromData:completionHandler:),
-                  &gOrig_uploadTaskWithRequest_fromData_completion);
+    gSwizzledClasses = [[NSMutableSet alloc] init];
+    gTaskMap = [[NSMutableDictionary alloc] init];
+
+    // 1) 遍历所有 NSURLSession 子类
+    Class sessionCls = NSClassFromString(@"NSURLSession");
+    if (sessionCls) {
+        unsigned int count = 0;
+        Class *classList = objc_copyClassList(&count);
+        for (unsigned int i = 0; i < count; i++) {
+            Class cls = classList[i];
+            Class superCls = class_getSuperclass(cls);
+            // 找 NSURLSession 的直接子类 + 孙子类（递归判断）
+            Class tmp = cls;
+            while (tmp) {
+                if (tmp == sessionCls) {
+                    DYPSwizzleSessionSubclass(cls);
+                    break;
+                }
+                tmp = class_getSuperclass(tmp);
+            }
+        }
+        free(classList);
+    }
+
+    // 2) Hook NSURLSessionTask -resume（兜底，覆盖所有 task 类型）
+    Class taskCls = NSClassFromString(@"NSURLSessionTask");
+    if (taskCls) {
+        DYPSwizzleOne(taskCls,
+                      @selector(resume),
+                      @selector(dyp_resume),
+                      &gOrig_taskResume);
+    }
+
+    NSLog(@"[DYProbe] swizzle done: %d NSURLSession subclasses, taskResume=%p",
+          gDiagSubclassCount, gOrig_taskResume);
 }
 
 #pragma mark - Entry
@@ -359,10 +494,23 @@ static void DYProbeInit(void) {
         NSLog(@"[DYProbe] BSS captured, output=%@", gOutputPath);
     });
 
-    // 周期性 flush（防止用户拷文件时还没写盘）
+    // NSURLSession 私有子类可能 lazy 加载，多次重跑 install 抓最新子类
+    for (int sec = 0; sec <= 10; sec++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            DYPInstallSwizzle();
+            DYPFlushDump();
+        });
+    }
+
+    // 周期性 flush + 重 install（防止用户拷文件时还没写盘）
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
         while (1) {
             [NSThread sleepForTimeInterval:5.0];
+            // 每 5 秒重新 install 一次（覆盖晚期 lazy 子类）
+            dispatch_async(dispatch_get_main_queue(), ^{
+                DYPInstallSwizzle();
+            });
             DYPFlushDump();
         }
     });
